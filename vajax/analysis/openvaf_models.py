@@ -510,8 +510,31 @@ def compile_openvaf_models(
             f"  {model_type}: init function done in {t4 - t3:.1f}s (cache_size={init_meta['cache_size']})"
         )
 
-        # Build init->eval index mapping
-        eval_name_to_idx = {n.lower(): i for i, n in enumerate(param_names)}
+        # Build init->eval index mapping (case-insensitive).
+        # A model can expose an *input* param and a same-named *hidden_state* cache slot that
+        # collide when lowercased (EKV: input `TNOM` vs hidden_state `Tnom`). Init params are
+        # INPUTS and must source their runtime value from the input slot; a naive last-wins
+        # lowercase map can point them at the hidden_state slot (value 0.0), silently zeroing
+        # the parameter (e.g. TNOM -> 0 -> nominal temperature Tnom = 0 degC). Prefer real
+        # input kinds over hidden_state on collision.
+        _INPUT_KINDS = frozenset(
+            {"param", "param_given", "temperature", "voltage", "implicit_unknown", "sysfun"}
+        )
+        eval_name_to_idx: Dict[str, int] = {}
+        for i, n in enumerate(param_names):
+            key = n.lower()
+            prev = eval_name_to_idx.get(key)
+            if prev is None:
+                eval_name_to_idx[key] = i
+                continue
+            cur_input = param_kinds[i] in _INPUT_KINDS
+            prev_input = param_kinds[prev] in _INPUT_KINDS
+            # Preserve the legacy last-wins choice *among entries of the same preference*
+            # (e.g. a `param` vs its `param_given` twin — both inputs); only let an input-kind
+            # entry override a previously-selected non-input (hidden_state) slot. This narrows
+            # the change to exactly the shadowed-input bug (TNOM/NVTM/mfactor/...).
+            if cur_input == prev_input or (cur_input and not prev_input):
+                eval_name_to_idx[key] = i
         init_to_eval_indices = []
         for name in init_meta["param_names"]:
             eval_idx = eval_name_to_idx.get(name.lower(), -1)
@@ -766,7 +789,13 @@ def prepare_static_inputs(
         for pname, cols in param_to_cols.items():
             if pname not in all_unique:
                 if pname in ("tnom", "tref", "tr"):
-                    default = 27.0
+                    # Un-given nominal temperature. Prefer the model's own literal default; if
+                    # the model expresses "not given" via the -`NOT_GIVEN sentinel idiom (EKV:
+                    # `if (TNOM == -`NOT_GIVEN) Tnom = `DEFAULT_TNOM + `P_CELSIUS0`), then
+                    # get_param_defaults drops that computed default, so fall back to the sentinel
+                    # and let the model select its own DEFAULT_TNOM (matches VACASK) rather than
+                    # reading a spurious 0/27 degC.
+                    default = model_defaults.get(pname, 1e21)
                 elif pname in ("temp", "temperature"):
                     # Device operating temperature: when not given, the model must fall back to the
                     # ambient $temperature. Compact models express this with a huge "not given"
