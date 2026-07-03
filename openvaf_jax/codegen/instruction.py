@@ -4,6 +4,7 @@ This module translates individual MIR instructions to JAX AST expressions.
 """
 
 import ast
+import math
 import re
 from typing import Dict, Optional
 
@@ -374,27 +375,54 @@ class InstructionTranslator:
         return unaryop(ast.Invert(), operand)
 
     def _translate_sqrt(self, inst: MIRInstruction) -> ast.expr:
-        """Translate sqrt with safe clamping for negative inputs."""
-        operand = self.ctx.get_operand(inst.operands[0])
-        # Clamp to zero to avoid NaN
-        clamped = jnp_call("maximum", operand, self.ctx.zero())
-        return jnp_call("sqrt", clamped)
+        """Translate sqrt, gradient-safe for x <= 0.
+
+        A plain ``sqrt(max(x, 0))`` has the right *value* everywhere but a NaN
+        *reverse-mode* gradient at x <= 0: ``sqrt'(0) = 1/(2*sqrt(0)) = inf`` and the
+        ``max`` routes a zero cotangent into it, giving ``0*inf = NaN`` (forward mode is
+        immune — it selects). The double-``where`` evaluates ``sqrt`` at a safe ``1.0`` on
+        the masked branch so the reverse gradient is finite. The value is identical to the
+        old lowering (``sqrt(x)`` for x>0, ``0`` for x<=0), so DC/forward results are
+        unchanged; this only unblocks reverse-mode AD (KB §2 fix 1 / §3h).
+        """
+        op = inst.operands[0]
+        positive = compare(self.ctx.get_operand(op), ast.Gt(), self.ctx.zero())
+        safe = jnp_where(
+            compare(self.ctx.get_operand(op), ast.Gt(), self.ctx.zero()),
+            self.ctx.get_operand(op),
+            self.ctx.one(),
+        )
+        return jnp_where(positive, jnp_call("sqrt", safe), self.ctx.zero())
+
+    # Small floor shared by the log lowerings; log(EPS) is the masked-branch value.
+    _LOG_EPS = 1e-300
 
     def _translate_ln(self, inst: MIRInstruction) -> ast.expr:
-        """Translate natural log with safe clamping."""
-        operand = self.ctx.get_operand(inst.operands[0])
-        # Clamp to small epsilon to avoid -inf
-        small_eps = ast_const(1e-300)
-        clamped = jnp_call("maximum", operand, small_eps)
-        return jnp_call("log", clamped)
+        """Translate natural log, gradient-safe for x <= eps.
+
+        Same gradient-safety issue as :meth:`_translate_sqrt`: the old ``log(max(x, eps))``
+        has a huge/ill 2nd-order reverse gradient near the clamp (``log'(eps)=1/eps``, and the
+        ``max`` routes a zero cotangent → ``0·inf=NaN`` under reverse-over-forward). The
+        double-``where`` evaluates ``log`` at a safe ``1.0`` on the masked branch; value is
+        identical to ``log(max(x, eps))`` (``log(x)`` for x>eps, ``log(eps)`` otherwise).
+        """
+        return self._safe_log("log", inst)
 
     def _translate_log10(self, inst: MIRInstruction) -> ast.expr:
-        """Translate base-10 log with safe clamping."""
-        operand = self.ctx.get_operand(inst.operands[0])
-        # Clamp to small epsilon to avoid -inf
-        small_eps = ast_const(1e-300)
-        clamped = jnp_call("maximum", operand, small_eps)
-        return jnp_call("log10", clamped)
+        """Translate base-10 log, gradient-safe (see :meth:`_translate_ln`)."""
+        return self._safe_log("log10", inst)
+
+    def _safe_log(self, jnp_fn: str, inst: MIRInstruction) -> ast.expr:
+        op = inst.operands[0]
+        eps = self._LOG_EPS
+        masked = math.log10(eps) if jnp_fn == "log10" else math.log(eps)
+        positive = compare(self.ctx.get_operand(op), ast.Gt(), ast_const(eps))
+        safe = jnp_where(
+            compare(self.ctx.get_operand(op), ast.Gt(), ast_const(eps)),
+            self.ctx.get_operand(op),
+            self.ctx.one(),
+        )
+        return jnp_where(positive, jnp_call(jnp_fn, safe), ast_const(masked))
 
     def _translate_clog2(self, inst: MIRInstruction) -> ast.expr:
         """Translate ceiling of log base 2.
