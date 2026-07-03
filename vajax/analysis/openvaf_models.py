@@ -511,29 +511,30 @@ def compile_openvaf_models(
         )
 
         # Build init->eval index mapping (case-insensitive).
-        # A model can expose an *input* param and a same-named *hidden_state* cache slot that
-        # collide when lowercased (EKV: input `TNOM` vs hidden_state `Tnom`). Init params are
-        # INPUTS and must source their runtime value from the input slot; a naive last-wins
-        # lowercase map can point them at the hidden_state slot (value 0.0), silently zeroing
-        # the parameter (e.g. TNOM -> 0 -> nominal temperature Tnom = 0 degC). Prefer real
-        # input kinds over hidden_state on collision.
-        _INPUT_KINDS = frozenset(
-            {"param", "param_given", "temperature", "voltage", "implicit_unknown", "sysfun"}
+        # An init param sources its runtime *value* from the eval input slot of the same name. A
+        # model can expose several eval slots that collide when lowercased: a value `param`, its
+        # `param_given` flag, and a `hidden_state` cache slot (e.g. EKV `TNOM`/`Tnom`; BSIM4
+        # exposes all three for `tnom`, `vth0`, `u0`, ...). A naive last-wins lowercase map points
+        # the init param at whichever comes last — the hidden_state (an init *output*, value 0.0)
+        # or the given-flag (0/1) — silently corrupting the parameter. Rank by preference so a
+        # value-param always reads its value: value-input > param_given > hidden_state; last-wins
+        # within a tier (legacy behaviour among equal-preference slots).
+        _VALUE_INPUT_KINDS = frozenset(
+            {"param", "temperature", "voltage", "implicit_unknown", "sysfun"}
         )
+
+        def _name_pref(kind: str) -> int:
+            if kind in _VALUE_INPUT_KINDS:
+                return 2
+            if kind == "param_given":
+                return 1
+            return 0  # hidden_state and everything else (init outputs)
+
         eval_name_to_idx: Dict[str, int] = {}
         for i, n in enumerate(param_names):
             key = n.lower()
             prev = eval_name_to_idx.get(key)
-            if prev is None:
-                eval_name_to_idx[key] = i
-                continue
-            cur_input = param_kinds[i] in _INPUT_KINDS
-            prev_input = param_kinds[prev] in _INPUT_KINDS
-            # Preserve the legacy last-wins choice *among entries of the same preference*
-            # (e.g. a `param` vs its `param_given` twin — both inputs); only let an input-kind
-            # entry override a previously-selected non-input (hidden_state) slot. This narrows
-            # the change to exactly the shadowed-input bug (TNOM/NVTM/mfactor/...).
-            if cur_input == prev_input or (cur_input and not prev_input):
+            if prev is None or _name_pref(param_kinds[i]) >= _name_pref(param_kinds[prev]):
                 eval_name_to_idx[key] = i
         init_to_eval_indices = []
         for name in init_meta["param_names"]:
