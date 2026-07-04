@@ -62,6 +62,16 @@ class FunctionBuilder:
         self.sccp: Optional["SCCP"] = None  # SCCP for dead block elimination
         self.codegen_warnings: list[str] = []  # Warnings from code generation
         self.simparam_metadata: dict = {}  # Simparam registry metadata after build
+        # When True, emit natural loops as a static-length ``lax.scan`` (with a
+        # ``jnp.where``-freeze on the loop predicate) instead of ``lax.while_loop``.
+        # ``lax.scan`` is reverse-mode transposable, so this unblocks ``jacrev``/``grad``
+        # through models whose init/eval contains counted loops (e.g. BSIM4's toxp/nf
+        # loops). Default OFF: every existing model emits byte-identical code.
+        self.differentiable_loops: bool = False
+        # Static iteration count (upper bound) used for the scan when
+        # ``differentiable_loops`` is on. Must be >= the loop's max trip count; the
+        # where-freeze makes iterations past the real exit count exact no-ops.
+        self.max_loop_unroll: int = 16
 
     def _emit_preamble(self, body: List[ast.stmt], ctx: CodeGenContext):
         """Emit function preamble: imports."""
@@ -324,12 +334,19 @@ class FunctionBuilder:
         body_fn = function_def("_loop_body", ["_state"], loop_body_stmts)
         body.append(body_fn)
 
-        # Call while_loop
-        loop_call = ast_call(
-            attr(ast_name("lax"), "while_loop"),
-            [ast_name("_loop_cond"), ast_name("_loop_body"), init_state],
-        )
-        body.append(assign("_loop_result", loop_call))
+        if self.differentiable_loops:
+            # Reverse-mode-transposable path: run the body a fixed number of
+            # iterations via lax.scan, freezing the carry once the original loop
+            # predicate goes false (idempotent for converged fixed points; gated
+            # accumulators add nothing past the real exit). See _emit_scan_loop.
+            self._emit_scan_loop(body, ctx, loop_state, init_state)
+        else:
+            # Call while_loop
+            loop_call = ast_call(
+                attr(ast_name("lax"), "while_loop"),
+                [ast_name("_loop_cond"), ast_name("_loop_body"), init_state],
+            )
+            body.append(assign("_loop_result", loop_call))
 
         # Unpack results
         for i, (result, _, _) in enumerate(loop_state):
@@ -338,6 +355,63 @@ class FunctionBuilder:
                 body.append(assign(var_name, subscript(ast_name("_loop_result"), ast_const(i))))
             else:
                 body.append(assign(var_name, ast_name("_loop_result")))
+
+    def _emit_scan_loop(
+        self,
+        body: List[ast.stmt],
+        ctx: CodeGenContext,
+        loop_state: List[Tuple[ValueId, ValueId, ValueId]],
+        init_state: ast.expr,
+    ) -> None:
+        """Emit a static-length ``lax.scan`` equivalent of the ``_loop_cond``/``_loop_body``
+        while-loop, so the loop is reverse-mode differentiable.
+
+        Assumes ``_loop_cond`` and ``_loop_body`` have already been emitted (they are, by
+        ``_emit_loop``). Runs the body for a fixed ``self.max_loop_unroll`` iterations and
+        freezes the carry once ``_loop_cond`` goes false::
+
+            def _scan_body(_carry, _x):
+                _pred = _loop_cond(_carry)
+                _upd  = _loop_body(_carry)
+                _new  = where(_pred, _upd, _carry)   # elementwise for tuples
+                return _new, None
+            _loop_result = lax.scan(_scan_body, init_state, None, length=N)[0]
+
+        For an exited/converged iteration the freeze reproduces the carry exactly, so the
+        scan's final state equals the while-loop's whenever N >= the real trip count
+        (idempotent fixed points; predicate-gated accumulators).
+        """
+        multi = len(loop_state) > 1
+
+        pred_call = ast_call(ast_name("_loop_cond"), [ast_name("_carry")])
+        upd_call = ast_call(ast_name("_loop_body"), [ast_name("_carry")])
+
+        scan_body: List[ast.stmt] = [
+            assign("_pred", pred_call),
+            assign("_upd", upd_call),
+        ]
+        if multi:
+            new_elts = [
+                jnp_where(
+                    ast_name("_pred"),
+                    subscript(ast_name("_upd"), ast_const(i)),
+                    subscript(ast_name("_carry"), ast_const(i)),
+                )
+                for i in range(len(loop_state))
+            ]
+            new_state: ast.expr = tuple_expr(new_elts)
+        else:
+            new_state = jnp_where(ast_name("_pred"), ast_name("_upd"), ast_name("_carry"))
+        scan_body.append(return_stmt(tuple_expr([new_state, ast_const(None)])))
+
+        body.append(function_def("_scan_body", ["_carry", "_x"], scan_body))
+
+        scan_call = ast_call(
+            attr(ast_name("lax"), "scan"),
+            [ast_name("_scan_body"), init_state, ast_const(None)],
+            keywords=[ast.keyword(arg="length", value=ast_const(int(self.max_loop_unroll)))],
+        )
+        body.append(assign("_loop_result", subscript(scan_call, ast_const(0))))
 
     def _build_loop_cond(
         self,

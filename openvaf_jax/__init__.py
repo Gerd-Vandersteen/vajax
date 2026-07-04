@@ -1193,7 +1193,12 @@ class OpenVAFToJAX:
         return init_fn, metadata
 
     def translate_init_array_split(
-        self, shared_indices: List[int], varying_indices: List[int], init_to_eval: List[int]
+        self,
+        shared_indices: List[int],
+        varying_indices: List[int],
+        init_to_eval: List[int],
+        differentiable_loops: bool = False,
+        max_loop_unroll: int = 16,
     ) -> Tuple[Callable, Dict]:
         """Generate a vmappable init function with split shared/device params (internal API).
 
@@ -1230,6 +1235,10 @@ class OpenVAFToJAX:
         builder = InitFunctionBuilder(
             self.init_mir, self.cache_mapping, self.collapse_decision_outputs
         )
+        # Reverse-mode transposable loops (lax.scan) — needed for jacrev through models
+        # whose split-init has counted loops (BSIM4). Byte-identical when off (default).
+        builder.differentiable_loops = differentiable_loops
+        builder.max_loop_unroll = max_loop_unroll
         fn_name, code_lines = builder.build_split(shared_indices, varying_indices, init_to_eval)
 
         t1 = time.perf_counter()

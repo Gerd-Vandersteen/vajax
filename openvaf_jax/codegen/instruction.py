@@ -108,9 +108,8 @@ class InstructionTranslator:
         "fabs": "abs",
     }
 
-    # Binary jnp functions
+    # Binary jnp functions ("pow" is handled by the gradient-safe _translate_pow, not here)
     BINARY_JNP_MAP = {
-        "pow": "power",
         "atan2": "arctan2",
         "hypot": "hypot",
         "fmin": "minimum",
@@ -219,6 +218,10 @@ class InstructionTranslator:
         # Ceiling log base 2
         if opcode == "clog2":
             return self._translate_clog2(inst)
+
+        # Power (gradient-safe: jnp.power has a NaN gradient for base < 0)
+        if opcode == "pow":
+            return self._translate_pow(inst)
 
         # Unary jnp functions
         if opcode in self.UNARY_JNP_SAME:
@@ -436,6 +439,47 @@ class InstructionTranslator:
         clamped = jnp_call("maximum", operand, small_eps)
         log2_val = jnp_call("log2", clamped)
         return jnp_call("ceil", log2_val)
+
+    def _translate_pow(self, inst: MIRInstruction) -> ast.expr:
+        """Translate ``base ** exp``, gradient-safe (value-identical) for base <= 0.
+
+        ``jnp.power(x, y)`` has a **NaN gradient** whenever ``x < 0``: its exponent-derivative
+        is ``x**y * ln(x)`` and ``ln(x<0)`` is NaN, so even a *constant* exponent (``dy = 0``)
+        gives ``NaN * 0 = NaN`` in both forward and reverse AD. Unlike ``sqrt``/``ln``, a signed
+        base is a **real, value-bearing** case for BSIM4 (e.g. a scaled geometry term raised to a
+        near-integer power feeds a divisor), so it must **not** be masked to zero — the primal
+        must be preserved. This lowering keeps the exact value and both first derivatives:
+
+            x**y = power(x, stop_gradient(y))                         # value + d/dx (all orders in x)
+                 + sg(where(x>0, power(x, y) * log(where(x>0, x, 1)), 0)) * (y - stop_gradient(y))
+
+        The first term carries the value and the base-derivative ``y*x**(y-1)`` (finite for x<0
+        with integer y-1) with the exponent frozen so no ``ln(x)`` is taken. The second term
+        re-injects the exponent-derivative ``x**y * ln(x)`` for x>0 only (0 for x<=0, where a real
+        exponent-derivative is undefined); its coefficient is ``stop_gradient``'d and multiplied by
+        ``(y - stop_gradient(y))`` (== 0 at the primal), so it changes no value and no base grad.
+        Result: value byte-identical to ``jnp.power``, correct 1st derivatives, correct d2/dx2, and
+        finite tangents at base <= 0 (KB §2 fix 1, generalized from sqrt/ln to pow).
+        """
+        op_base, op_exp = inst.operands[0], inst.operands[1]
+
+        def base() -> ast.expr:
+            return self.ctx.get_operand(op_base)
+
+        def exp() -> ast.expr:
+            return self.ctx.get_operand(op_exp)
+
+        def sg(x: ast.expr) -> ast.expr:
+            return ast_call(attr(ast_name("lax"), "stop_gradient"), [x])
+
+        # value + d/d(base); exponent frozen so power's ln(base) exponent-derivative is never taken
+        base_part = jnp_call("power", base(), sg(exp()))
+        # d/d(exp) for base > 0 (safe log), 0 for base <= 0; frozen coefficient, zero at the primal
+        safe_base = jnp_where(compare(base(), ast.Gt(), self.ctx.zero()), base(), self.ctx.one())
+        log_term = binop(jnp_call("power", base(), exp()), ast.Mult(), jnp_call("log", safe_base))
+        exp_coeff = sg(jnp_where(compare(base(), ast.Gt(), self.ctx.zero()), log_term, self.ctx.zero()))
+        exp_delta = binop(exp(), ast.Sub(), sg(exp()))
+        return binop(base_part, ast.Add(), binop(exp_coeff, ast.Mult(), exp_delta))
 
     def _translate_unary_jnp(self, inst: MIRInstruction, func_name: str) -> ast.expr:
         """Translate unary jnp function."""
