@@ -582,6 +582,58 @@ def compile_openvaf_models(
     return compiled_models
 
 
+def _resolve_collapse_decision_outputs(compiled: Dict[str, Any]) -> List[Tuple[int, str]]:
+    """The ``(pair_idx, decision_var)`` list that orders ``init_fn``'s collapse outputs.
+
+    ``init_fn`` emits ONE collapse value per entry of ``collapse_decision_outputs``, in that
+    order (openvaf_jax ``_emit_collapse_decisions``). The list is on the compiled VaModule; the
+    vajax ``compiled_models`` dict does not always copy it, so fall back to the module. Empty if
+    unavailable (callers then use positional mapping).
+    """
+    cdo = compiled.get("collapse_decision_outputs")
+    if not cdo:
+        mod = compiled.get("module")
+        if mod is not None:
+            cdo = getattr(mod, "collapse_decision_outputs", None)
+    return list(cdo or [])
+
+
+def _pairs_from_collapse_decisions(
+    collapse_decisions: Any,
+    collapsible_pairs: List[Tuple[int, int]],
+    collapse_decision_outputs: List[Tuple[int, str]],
+) -> List[Tuple[int, int]]:
+    """Map ``init_fn``'s collapse-decision array to the collapsible pairs that fire.
+
+    ``init_fn`` returns one value per ``collapse_decision_outputs`` entry ``(pair_idx, var)``,
+    in that order. A single pair may have SEVERAL decision outputs (BSIM4's gate ``gi->gm`` and
+    body ``bi->b`` each have two guards): the pair collapses if ANY of its guards fires (OR).
+
+    The naive ``collapse[i] > 0.5 -> collapsible_pairs[i]`` mapping is WRONG whenever a pair has
+    more than one output — the duplicates shift every later index, so e.g. BSIM4 wrongly kept
+    ``gi->gm``/``bi->b`` uncollapsed and the intrinsic gate floated (``Id`` flat). Remapping via
+    ``collapse_decision_outputs[k][0]`` fixes it. A pair with no decision output has no guard →
+    it collapses unconditionally (matches the no-``init_fn`` fallback). Falls back to positional
+    only when the decision-output map is unavailable.
+    """
+    n = len(collapsible_pairs)
+    collapse_np = np.asarray(collapse_decisions)
+    if collapse_decision_outputs:
+        fired = [False] * n
+        guarded = [False] * n
+        for k, (pair_idx, _var) in enumerate(collapse_decision_outputs):
+            if 0 <= pair_idx < n and k < len(collapse_np):
+                guarded[pair_idx] = True
+                if float(collapse_np[k]) > 0.5:
+                    fired[pair_idx] = True
+        return [collapsible_pairs[i] for i in range(n) if fired[i] or not guarded[i]]
+    return [
+        collapsible_pairs[i]
+        for i in range(n)
+        if i < len(collapse_np) and float(collapse_np[i]) > 0.5
+    ]
+
+
 def compute_early_collapse_decisions(
     devices: List[Dict],
     compiled_models: Dict[str, Any],
@@ -625,6 +677,9 @@ def compute_early_collapse_decisions(
         n_init_params = len(init_param_names)
         collapsible_pairs = compiled.get("collapsible_pairs", [])
         n_collapsible = len(collapsible_pairs)
+        # Maps each init_fn collapse output to its pair (a pair may have several); see
+        # _pairs_from_collapse_decisions. Empty -> positional fallback.
+        collapse_decision_outputs = _resolve_collapse_decision_outputs(compiled)
 
         if n_init_params == 0 or n_collapsible == 0:
             if init_fn is not None and n_collapsible > 0:
@@ -632,10 +687,9 @@ def compute_early_collapse_decisions(
                     cpu_device = jax.devices("cpu")[0]
                     with jax.default_device(cpu_device):
                         _, collapse_decisions = init_fn(jnp.array([]))
-                    pairs = []
-                    for i, (n1, n2) in enumerate(collapsible_pairs):
-                        if i < len(collapse_decisions) and float(collapse_decisions[i]) > 0.5:
-                            pairs.append((n1, n2))
+                    pairs = _pairs_from_collapse_decisions(
+                        collapse_decisions, collapsible_pairs, collapse_decision_outputs
+                    )
                     for dev in devs:
                         device_collapse_decisions[dev["name"]] = pairs
                     continue
@@ -681,11 +735,9 @@ def compute_early_collapse_decisions(
                     init_inputs = jnp.array(param_key, dtype=get_float_dtype())
                     _, collapse_decisions = init_fn(init_inputs)
 
-                pairs = []
-                collapse_np = np.asarray(collapse_decisions)
-                for i, (n1, n2) in enumerate(collapsible_pairs):
-                    if i < len(collapse_np) and collapse_np[i] > 0.5:
-                        pairs.append((n1, n2))
+                pairs = _pairs_from_collapse_decisions(
+                    collapse_decisions, collapsible_pairs, collapse_decision_outputs
+                )
 
                 for dev in param_devs:
                     device_collapse_decisions[dev["name"]] = pairs
