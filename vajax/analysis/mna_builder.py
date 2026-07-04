@@ -541,12 +541,19 @@ def make_mna_build_system_fn(
         Q_prev2: Array | None = None,
         limit_state_in: Array | None = None,
         nr_iteration: int | Array = 1,
+        shared_params_override: "Optional[Dict[str, Array]]" = None,
     ) -> Tuple[Any, Array, Array, Array, Array, Array]:
         """Build augmented Jacobian J and residual f for MNA.
 
         Returns (J_or_csr_data, f, Q, I_vsource, limit_state_out, max_res_contrib).
         When use_csr_direct=True, J_or_csr_data is a 1D CSR data array.
         Otherwise, J_or_csr_data is a dense matrix or BCOO sparse matrix.
+
+        shared_params_override: optional {model_type: shared_params_array} REPLACING the captured
+        (baseline) shared_params for a model's device eval. Default None keeps the baseline (all
+        existing callers unchanged). Makes the residual differentiable w.r.t. eval-direct
+        (non-cached) params kept live in the split eval (see openvaf_models.LIVE_EVAL_PARAMS) —
+        their sensitivity flows through this path, not the device cache.
         """
         n_total = n_unknowns + 1
         V = X[:n_total]
@@ -573,6 +580,7 @@ def make_mna_build_system_fn(
                 limit_state_in,
                 nr_iteration,
                 limit_state_out,
+                shared_params_override,
             )
         else:
             return _build_system_coo(
@@ -593,6 +601,7 @@ def make_mna_build_system_fn(
                 limit_state_in,
                 nr_iteration,
                 limit_state_out,
+                shared_params_override,
             )
 
     def _build_system_coo(
@@ -613,6 +622,7 @@ def make_mna_build_system_fn(
         limit_state_in,
         nr_iteration,
         limit_state_out,
+        shared_params_override=None,
     ):
         """COO assembly path (original implementation)."""
         f_resist_parts: List[Any] = []
@@ -667,7 +677,12 @@ def make_mna_build_system_fn(
                 _,
                 batch_limit_state_out,
             ) = split_info["vmapped_split_eval"](
-                split_info["shared_params"],
+                (
+                    shared_params_override[model_type]
+                    if shared_params_override is not None
+                    and model_type in shared_params_override
+                    else split_info["shared_params"]
+                ),
                 device_params_updated,
                 split_info["shared_cache"],
                 cache,
@@ -774,6 +789,7 @@ def make_mna_build_system_fn(
         limit_state_in,
         nr_iteration,
         limit_state_out,
+        shared_params_override=None,
     ):
         """CSR direct stamping path. Stamps device Jacobian entries directly
         into a pre-allocated CSR data array, eliminating COO intermediates."""
@@ -834,7 +850,12 @@ def make_mna_build_system_fn(
                 limit_padded = jnp.zeros((bi["padded_size"], n_lim), dtype=dtype)
                 limit_padded = limit_padded.at[:n_dev].set(model_limit_state_in)
 
-                shared_params = split_info["shared_params"]
+                shared_params = (
+                    shared_params_override[model_type]
+                    if shared_params_override is not None
+                    and model_type in shared_params_override
+                    else split_info["shared_params"]
+                )
                 shared_cache = split_info["shared_cache"]
                 voltage_positions = split_info["voltage_positions"]
                 vmapped_fn = split_info["vmapped_split_eval"]
@@ -935,7 +956,12 @@ def make_mna_build_system_fn(
                     _,
                     batch_limit_state_out,
                 ) = split_info["vmapped_split_eval"](
-                    split_info["shared_params"],
+                    (
+                        shared_params_override[model_type]
+                        if shared_params_override is not None
+                        and model_type in shared_params_override
+                        else split_info["shared_params"]
+                    ),
                     device_params_updated,
                     split_info["shared_cache"],
                     cache,

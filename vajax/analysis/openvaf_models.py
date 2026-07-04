@@ -75,6 +75,16 @@ except ImportError:
 # Keyed by model_type, contains translator, functions, metadata
 COMPILED_MODEL_CACHE: Dict[str, Any] = {}
 
+# Opt-in registry: model_type -> set of (lowercased) param names that a consumer wants kept
+# LIVE in the compiled eval, i.e. NOT SCCP-constant-folded, so the eval stays differentiable w.r.t.
+# them. Needed for params read *directly by the eval* (their sensitivity does not flow through the
+# device cache) -- e.g. the resistor's `r`, ASM-HEMT voff/u0/vsat. A live param is read at runtime
+# from `shared_params`, and a caller supplies the θ-injected values via
+# `build_system_mna(..., shared_params_override=...)`. Register BEFORE model compilation (it is read
+# in the SCCP-seed step below). Opt-in per model on purpose: keeping params live globally regresses
+# large models (BSIM4). Empty by default -> all existing behaviour unchanged.
+LIVE_EVAL_PARAMS: "Dict[str, set]" = {}
+
 
 def release_model_memory(model_types: Optional[List[str]] = None) -> dict:
     """Release heavy MIR data and Rust module references from cached models.
@@ -972,7 +982,13 @@ def prepare_static_inputs(
         # Build SCCP known values for constant propagation (TYPE specialization, etc.)
         # Maps MIR value IDs to constant values for shared params AND cache values.
         sccp_known_values = {}
+        _live_params = {str(p).lower() for p in LIVE_EVAL_PARAMS.get(model_type, ())}
         for j, orig_idx in enumerate(shared_indices):
+            # Keep opted-in params LIVE (skip SCCP folding) so the eval stays differentiable w.r.t.
+            # them; their runtime value comes from shared_params (see build_system_mna's
+            # shared_params_override). Sensitivity for these does not flow through the device cache.
+            if _live_params and str(param_names[orig_idx]).lower() in _live_params:
+                continue
             value_id = translator.param_idx_to_val.get(orig_idx)
             if value_id is not None:
                 sccp_known_values[value_id] = shared_params_list[j]
