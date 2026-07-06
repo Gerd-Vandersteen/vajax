@@ -542,6 +542,7 @@ def make_mna_build_system_fn(
         limit_state_in: Array | None = None,
         nr_iteration: int | Array = 1,
         shared_params_override: "Optional[Dict[str, Array]]" = None,
+        shared_cache_override: "Optional[Dict[str, Array]]" = None,
     ) -> Tuple[Any, Array, Array, Array, Array, Array]:
         """Build augmented Jacobian J and residual f for MNA.
 
@@ -554,6 +555,13 @@ def make_mna_build_system_fn(
         existing callers unchanged). Makes the residual differentiable w.r.t. eval-direct
         (non-cached) params kept live in the split eval (see openvaf_models.LIVE_EVAL_PARAMS) —
         their sensitivity flows through this path, not the device cache.
+
+        shared_cache_override: optional {model_type: shared_cache_array} REPLACING the captured
+        (baseline) shared_cache for a model's device eval. Default None keeps the baseline. Needed
+        for MULTI-INSTANCE sensitivity: with >1 device the split-init hoists cache columns whose
+        values are constant across devices (e.g. those derived from shared model-card params) into
+        shared_cache; if those depend on a differentiable leaf (EKV VTO/L), the injected per-device
+        device_cache alone is not enough — the shared_cache must also be rebuilt from live params.
         """
         n_total = n_unknowns + 1
         V = X[:n_total]
@@ -581,6 +589,7 @@ def make_mna_build_system_fn(
                 nr_iteration,
                 limit_state_out,
                 shared_params_override,
+                shared_cache_override,
             )
         else:
             return _build_system_coo(
@@ -602,6 +611,7 @@ def make_mna_build_system_fn(
                 nr_iteration,
                 limit_state_out,
                 shared_params_override,
+                shared_cache_override,
             )
 
     def _build_system_coo(
@@ -623,6 +633,7 @@ def make_mna_build_system_fn(
         nr_iteration,
         limit_state_out,
         shared_params_override=None,
+        shared_cache_override=None,
     ):
         """COO assembly path (original implementation)."""
         f_resist_parts: List[Any] = []
@@ -684,7 +695,12 @@ def make_mna_build_system_fn(
                     else split_info["shared_params"]
                 ),
                 device_params_updated,
-                split_info["shared_cache"],
+                (
+                    shared_cache_override[model_type]
+                    if shared_cache_override is not None
+                    and model_type in shared_cache_override
+                    else split_info["shared_cache"]
+                ),
                 cache,
                 simparams,
                 model_limit_state_in,
@@ -790,6 +806,7 @@ def make_mna_build_system_fn(
         nr_iteration,
         limit_state_out,
         shared_params_override=None,
+        shared_cache_override=None,
     ):
         """CSR direct stamping path. Stamps device Jacobian entries directly
         into a pre-allocated CSR data array, eliminating COO intermediates."""
@@ -856,7 +873,12 @@ def make_mna_build_system_fn(
                     and model_type in shared_params_override
                     else split_info["shared_params"]
                 )
-                shared_cache = split_info["shared_cache"]
+                shared_cache = (
+                    shared_cache_override[model_type]
+                    if shared_cache_override is not None
+                    and model_type in shared_cache_override
+                    else split_info["shared_cache"]
+                )
                 voltage_positions = split_info["voltage_positions"]
                 vmapped_fn = split_info["vmapped_split_eval"]
                 uses_analysis = split_info["uses_analysis"]
@@ -963,7 +985,12 @@ def make_mna_build_system_fn(
                         else split_info["shared_params"]
                     ),
                     device_params_updated,
-                    split_info["shared_cache"],
+                    (
+                        shared_cache_override[model_type]
+                        if shared_cache_override is not None
+                        and model_type in shared_cache_override
+                        else split_info["shared_cache"]
+                    ),
                     cache,
                     simparams,
                     model_limit_state_in,

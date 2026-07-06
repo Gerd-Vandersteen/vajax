@@ -1807,6 +1807,7 @@ class CircuitEngine:
         n_unknowns: int,
         vsource_dc_vals: Array,
         isource_dc_vals: Array,
+        shared_cache_override: "Optional[Dict[str, Array]]" = None,
     ) -> Tuple[Array, Array]:
         """Extract resistive and reactive Jacobians at given operating point.
 
@@ -1818,6 +1819,10 @@ class CircuitEngine:
             n_unknowns: Number of unknowns
             vsource_dc_vals: DC voltage source values
             isource_dc_vals: DC current source values
+            shared_cache_override: optional {model_type: shared_cache_array} REPLACING the captured
+                (baseline) shared_cache per model — the small-signal analogue of the DC builder's
+                override (mna_builder.build_system_mna). Needed for multi-instance sensitivity where
+                shared_cache depends on a differentiable leaf (see openvaf_models split-init).
 
         Returns:
             Tuple of (Jr, Jc) dense Jacobian matrices
@@ -1863,7 +1868,12 @@ class CircuitEngine:
             device_params = compiled["device_params"]
             voltage_positions = compiled["voltage_positions_in_varying"]
             vmapped_split_eval = compiled["vmapped_split_eval"]
-            shared_cache = compiled["shared_cache"]
+            shared_cache = (
+                shared_cache_override[model_type]
+                if shared_cache_override is not None
+                and model_type in shared_cache_override
+                else compiled["shared_cache"]
+            )
             default_simparams = compiled.get("default_simparams", jnp.array([0.0, 1.0, 1e-12]))
 
             # Update voltage columns in device_params
