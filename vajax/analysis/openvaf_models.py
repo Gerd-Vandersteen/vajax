@@ -546,9 +546,31 @@ def compile_openvaf_models(
             prev = eval_name_to_idx.get(key)
             if prev is None or _name_pref(param_kinds[i]) >= _name_pref(param_kinds[prev]):
                 eval_name_to_idx[key] = i
+        # `$param_given(p)` is exposed as its OWN eval input that shares p's *name* (e.g. BSIM4
+        # `vth0` collides three ways: a value `param`, a `param_given` flag, and a `hidden_state`
+        # slot, all named `vth0`). The value-preferred map above resolves that name to the value
+        # column, so an init `param_given` input would read the *value* (0.7, truthy) instead of the
+        # real 0/1 flag — making `$param_given` always true and skipping the compute-from-process
+        # init branches (`if (!$param_given(vth0)) vth0 = type*(vfb+phi+k1*sqrtPhi)`). BSIM4 `vth0`
+        # then stays pinned at its 0.7 default → DC `Id` ~9x off VACASK/OSDI on a sparse card. Route
+        # init `param_given` inputs to the eval `param_given` column of the same name (value/
+        # hidden_state routing is unchanged, so EKV's value-preferred TNOM fix is preserved).
+        eval_given_to_idx: Dict[str, int] = {
+            n.lower(): i for i, n in enumerate(param_names) if param_kinds[i] == "param_given"
+        }
         init_to_eval_indices = []
-        for name in init_meta["param_names"]:
-            eval_idx = eval_name_to_idx.get(name.lower(), -1)
+        for name, kind in zip(init_meta["param_names"], init_meta["param_kinds"]):
+            if kind == "param_given":
+                # Route to the dedicated eval `param_given` column (the true 0/1 flag). Not every
+                # init `param_given` input has one — instance geometry (`w`/`l`) is queried in init
+                # but not eval, so BSIM4 exposes 185 init flags vs 176 eval columns. For those keep
+                # the legacy name-only mapping onto the value column (truthy iff the param is set to
+                # a non-zero value), which is correct for always-given geometry.
+                eval_idx = eval_given_to_idx.get(name.lower())
+                if eval_idx is None:
+                    eval_idx = eval_name_to_idx.get(name.lower(), -1)
+            else:
+                eval_idx = eval_name_to_idx.get(name.lower(), -1)
             init_to_eval_indices.append(eval_idx)
         init_to_eval_indices = jnp.array(init_to_eval_indices, dtype=jnp.int32)
 
