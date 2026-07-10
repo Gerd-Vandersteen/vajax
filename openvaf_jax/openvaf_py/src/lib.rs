@@ -106,6 +106,10 @@ struct VaModule {
     /// Parameter Value indices (for debugging)
     #[pyo3(get)]
     param_value_indices: Vec<u32>,
+    /// 2nd-order (∂jac/∂param) sensitivity leaf names — the θ axis of param_jacobian_*_indices.
+    /// Empty unless the OPENVAF_2ND_ORDER feature was enabled at compile time. (VASAX Step 3.2)
+    #[pyo3(get)]
+    param_jacobian_param_names: Vec<String>,
     /// Node names
     #[pyo3(get)]
     nodes: Vec<String>,
@@ -139,6 +143,11 @@ struct VaModule {
     /// Jacobian sparsity structure (row/col node indices)
     jacobian_rows: Vec<u32>,
     jacobian_cols: Vec<u32>,
+    /// 2nd-order ∂jac/∂param MIR value ids, parallel to jacobian (outer = entry, inner = θ leaf,
+    /// aligned to param_jacobian_param_names). Empty unless the 2nd-order feature is enabled.
+    /// Consumed via get_dae_system()['jacobian'][i]['resist_dparam_vars']. (VASAX Step 3.2 Layer 2)
+    param_jacobian_resist_indices: Vec<Vec<u32>>,
+    param_jacobian_react_indices: Vec<Vec<u32>>,
     /// The compiled MIR function for evaluation
     eval_func: Function,
     /// Number of eval function parameters
@@ -854,9 +863,30 @@ impl VaModule {
                     jac_dict.set_item("has_react", true).unwrap();
                 }
 
+                // 2nd-order ∂jac/∂param MIR vars, aligned to param_jacobian_param_names (VASAX Step
+                // 3.2 Layer 2). Guarded: the tables are empty when the feature is off, but the loop
+                // runs over num_jacobian, so an unguarded [i] would panic.
+                if !self.param_jacobian_resist_indices.is_empty() {
+                    let resist_dparam: Vec<String> = self.param_jacobian_resist_indices[i]
+                        .iter()
+                        .map(|id| format!("mir_{}", id))
+                        .collect();
+                    let react_dparam: Vec<String> = self.param_jacobian_react_indices[i]
+                        .iter()
+                        .map(|id| format!("mir_{}", id))
+                        .collect();
+                    jac_dict.set_item("resist_dparam_vars", resist_dparam).unwrap();
+                    jac_dict.set_item("react_dparam_vars", react_dparam).unwrap();
+                }
+
                 jacobian_list.append(jac_dict).unwrap();
             }
             result.insert("jacobian".to_string(), jacobian_list.into());
+            // θ axis for the ∂jac/∂param vars above (empty unless the 2nd-order feature is enabled).
+            result.insert(
+                "param_jacobian_param_names".to_string(),
+                self.param_jacobian_param_names.clone().into_py(py),
+            );
 
             // Terminal and internal node lists
             result.insert("terminals".to_string(), terminal_names.clone().into_py(py));
@@ -1423,6 +1453,21 @@ fn compile_va(path: &str, allow_analog_in_cond: bool, allow_builtin_primitives: 
             jacobian_react_indices.push(u32::from(entry.react));
         }
 
+        // 2nd-order ∂jac/∂param (VASAX Step 3.2 Layer 2) — parallel to the jacobian above (same
+        // MatrixEntryId order). Empty unless the OPENVAF_2ND_ORDER feature was enabled.
+        let param_jacobian_param_names: Vec<String> = compiled
+            .dae_system
+            .param_jacobian_params
+            .iter()
+            .map(|p| p.name(&db).to_string())
+            .collect();
+        let mut param_jacobian_resist_indices: Vec<Vec<u32>> = Vec::new();
+        let mut param_jacobian_react_indices: Vec<Vec<u32>> = Vec::new();
+        for row in compiled.dae_system.param_jacobian.iter() {
+            param_jacobian_resist_indices.push(row.resist.iter().map(|v| u32::from(*v)).collect());
+            param_jacobian_react_indices.push(row.react.iter().map(|v| u32::from(*v)).collect());
+        }
+
         // Count actual Param-defined values in the eval function
         let mut max_param_idx: i32 = -1;
         for val in compiled.eval.dfg.values.iter() {
@@ -1821,6 +1866,7 @@ fn compile_va(path: &str, allow_analog_in_cond: bool, allow_builtin_primitives: 
             param_names,
             param_kinds,
             param_value_indices,
+            param_jacobian_param_names,
             nodes,
             num_residuals: compiled.dae_system.residual.len(),
             num_jacobian: compiled.dae_system.jacobian.len(),
@@ -1835,6 +1881,8 @@ fn compile_va(path: &str, allow_analog_in_cond: bool, allow_builtin_primitives: 
             jacobian_react_indices,
             jacobian_rows,
             jacobian_cols,
+            param_jacobian_resist_indices,
+            param_jacobian_react_indices,
             eval_func: compiled.eval.clone(),
             func_num_params,
             callback_names,
