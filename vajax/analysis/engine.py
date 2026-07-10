@@ -1896,7 +1896,8 @@ class CircuitEngine:
             model_limit_state_in = jnp.zeros((n_devices, n_lim), dtype=get_float_dtype())
 
             # Uniform interface: always pass shared_cache, device_cache (cache), limit_state_in
-            _, _, batch_jac_resist, batch_jac_react, _, _, _, _, _ = vmapped_split_eval(
+            # 11-tuple: trailing _, _ are the 2nd-order jac dparam arrays (VASAX Step 3.2 Layer 3)
+            _, _, batch_jac_resist, batch_jac_react, _, _, _, _, _, _, _ = vmapped_split_eval(
                 shared_params,
                 device_params_updated,
                 shared_cache,

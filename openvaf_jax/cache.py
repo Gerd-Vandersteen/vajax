@@ -157,9 +157,18 @@ def compute_va_hash(va_path: Path) -> str:
 
     Returns:
         SHA256 hash of the file content (first 16 chars)
+
+    The 2nd-order (∂jac/∂param) codegen config is folded in when enabled: OPENVAF_2ND_ORDER
+    changes the emitted eval (it adds the dparam arrays), so its compiles must not collide with
+    the default ones in the persistent cache. When the feature is off the hash is unchanged, so
+    existing (feature-off) caches stay valid. (VASAX Step 3.2)
     """
     content = va_path.read_bytes()
-    return hashlib.sha256(content).hexdigest()[:16]
+    h = hashlib.sha256(content)
+    if os.environ.get("OPENVAF_2ND_ORDER") is not None:
+        h.update(b"|2nd_order:")
+        h.update(os.environ.get("OPENVAF_2ND_ORDER_PARAMS", "w,l").encode())
+    return h.hexdigest()[:16]
 
 
 def get_model_cache_path(model_type: str, va_hash: str) -> Path:

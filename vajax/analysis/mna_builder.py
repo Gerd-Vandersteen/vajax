@@ -687,6 +687,8 @@ def make_mna_build_system_fn(
                 _,
                 _,
                 batch_limit_state_out,
+                _,  # jacobian_resist_dparam (VASAX Step 3.2 Layer 3)
+                _,  # jacobian_react_dparam
             ) = split_info["vmapped_split_eval"](
                 (
                     shared_params_override[model_type]
@@ -919,6 +921,8 @@ def make_mna_build_system_fn(
                         _,
                         _,
                         b_lim_out,
+                        _,  # jacobian_resist_dparam (VASAX Step 3.2 Layer 3)
+                        _,  # jacobian_react_dparam
                     ) = vmapped_fn(shared_params, b_dp, shared_cache, b_cache, simparams, b_limit)
 
                     # Stamp Jacobian into CSR
@@ -977,6 +981,8 @@ def make_mna_build_system_fn(
                     _,
                     _,
                     batch_limit_state_out,
+                    _,  # jacobian_resist_dparam (VASAX Step 3.2 Layer 3)
+                    _,  # jacobian_react_dparam
                 ) = split_info["vmapped_split_eval"](
                     (
                         shared_params_override[model_type]

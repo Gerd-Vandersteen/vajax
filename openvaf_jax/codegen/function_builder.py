@@ -1031,6 +1031,7 @@ class EvalFunctionBuilder(FunctionBuilder):
         # Build output arrays
         self._emit_residual_arrays(body, ctx)
         self._emit_jacobian_arrays(body, ctx)
+        self._emit_jacobian_dparam_arrays(body, ctx)
         self._emit_lim_rhs_arrays(body, ctx)
         self._emit_small_signal_arrays(body, ctx)
 
@@ -1038,10 +1039,12 @@ class EvalFunctionBuilder(FunctionBuilder):
         # This ensures consistent function signature regardless of whether model uses limits
         self._emit_limit_state_out(body, ctx)
 
-        # Return statement: (res_resist, res_react, jac_resist, jac_react,
+        # Return statement (11-tuple): (res_resist, res_react, jac_resist, jac_react,
         #                    lim_rhs_resist, lim_rhs_react,
-        #                    small_signal_resist, small_signal_react, limit_state_out)
-        # Note: limit_state_out is always returned (empty array if no limits) for uniform interface
+        #                    small_signal_resist, small_signal_react, limit_state_out,
+        #                    jacobian_resist_dparam, jacobian_react_dparam)
+        # Note: limit_state_out and the two 2nd-order d(jac)/d(param) arrays are always
+        # returned (empty when off) for a uniform interface. (VASAX Step 3.2 Layer 3)
         return_values = [
             ast_name("residuals_resist"),
             ast_name("residuals_react"),
@@ -1052,6 +1055,8 @@ class EvalFunctionBuilder(FunctionBuilder):
             ast_name("small_signal_resist"),
             ast_name("small_signal_react"),
             ast_name("limit_state_out"),
+            ast_name("jacobian_resist_dparam"),
+            ast_name("jacobian_react_dparam"),
         ]
         body.append(return_stmt(tuple_expr(return_values)))
 
@@ -1196,6 +1201,33 @@ class EvalFunctionBuilder(FunctionBuilder):
 
         body.append(assign("jacobian_resist", jnp_call("array", list_expr(resist_exprs))))
         body.append(assign("jacobian_react", jnp_call("array", list_expr(react_exprs))))
+
+    def _emit_jacobian_dparam_arrays(self, body: List[ast.stmt], ctx: CodeGenContext):
+        """Emit 2nd-order d(jac)/d(param) output arrays (VASAX Step 3.2 Layer 3).
+
+        Shape (n_jac_entries, n_params); the theta axis is
+        dae_data["param_jacobian_param_names"]. Parallel (row-major) to the 1-D
+        jacobian_resist/jacobian_react above, so entry i lines up with jacobian[i].
+        Empty shape (n_jac_entries, 0) when the 2nd-order feature is off (the FFI
+        omits the dparam keys) -> matches the "always emit, empty when off" convention.
+        """
+        resist_rows: List[ast.expr] = []
+        react_rows: List[ast.expr] = []
+
+        for entry in self.dae_data["jacobian"]:
+            resist_row: List[ast.expr] = []
+            for mir_ref in entry.get("resist_dparam_vars", []):
+                var = self._mir_to_var(mir_ref, ctx)
+                resist_row.append(ast_name(var) if var in ctx.defined_vars else ctx.zero())
+            react_row: List[ast.expr] = []
+            for mir_ref in entry.get("react_dparam_vars", []):
+                var = self._mir_to_var(mir_ref, ctx)
+                react_row.append(ast_name(var) if var in ctx.defined_vars else ctx.zero())
+            resist_rows.append(list_expr(resist_row))
+            react_rows.append(list_expr(react_row))
+
+        body.append(assign("jacobian_resist_dparam", jnp_call("array", list_expr(resist_rows))))
+        body.append(assign("jacobian_react_dparam", jnp_call("array", list_expr(react_rows))))
 
     def _emit_lim_rhs_arrays(self, body: List[ast.stmt], ctx: CodeGenContext):
         """Emit limiting RHS correction arrays.
@@ -1510,6 +1542,12 @@ class EvalFunctionBuilder(FunctionBuilder):
             for key in ["resist_var", "react_var"]:
                 mir_ref = entry.get(key, "")
                 if mir_ref:
+                    var_name = self._mir_to_var(mir_ref, ctx)
+                    if var_name:
+                        output_vars.add(var_name)
+            # 2nd-order d(jac)/d(param) vars (lists; absent when the feature is off)
+            for key in ["resist_dparam_vars", "react_dparam_vars"]:
+                for mir_ref in entry.get(key, []):
                     var_name = self._mir_to_var(mir_ref, ctx)
                     if var_name:
                         output_vars.add(var_name)

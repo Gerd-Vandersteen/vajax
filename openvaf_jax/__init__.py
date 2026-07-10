@@ -719,10 +719,11 @@ class OpenVAFToJAX:
         Returns:
             Tuple of (eval_fn, metadata)
 
-            eval_fn signature:
+            eval_fn signature (11-tuple):
                 eval_fn(shared_params, varying_params, cache, simparams, limit_state_in, limit_funcs)
                     -> (res_resist, res_react, jac_resist, jac_react,
-                        lim_rhs_resist, lim_rhs_react, ss_resist, ss_react, limit_state_out)
+                        lim_rhs_resist, lim_rhs_react, ss_resist, ss_react, limit_state_out,
+                        jac_resist_dparam, jac_react_dparam)  # last two: 2nd-order ∂jac/∂θ, empty when off
 
             simparams array layout:
                 - simparams[0] = analysis_type (0=DC, 1=AC, 2=transient, 3=noise)
@@ -985,6 +986,9 @@ class OpenVAFToJAX:
             "node_indices": node_indices,
             "jacobian_keys": jacobian_keys,
             "jacobian_indices": jacobian_indices,
+            # θ axis for the eval_fn's 2nd-order jacobian_{resist,react}_dparam outputs
+            # (empty unless the OPENVAF_2ND_ORDER feature was enabled). VASAX Step 3.2 Layer 3.
+            "param_jacobian_param_names": self.dae_data.get("param_jacobian_param_names", []),
             "terminals": self.dae_data["terminals"],
             "internal_nodes": self.dae_data["internal_nodes"],
             "num_terminals": self.dae_data["num_terminals"],
@@ -1305,17 +1309,15 @@ class OpenVAFToJAX:
         Returns:
             Tuple of (eval_fn, metadata)
 
-        Function signature (if cache is split):
+        Function signature (11-tuple; if cache is split):
             eval_fn(shared_params, device_params, shared_cache, device_cache, simparams[, limit_funcs])
                 -> (res_resist, res_react, jac_resist, jac_react,
                     lim_rhs_resist, lim_rhs_react,
-                    small_signal_resist, small_signal_react)
+                    small_signal_resist, small_signal_react, limit_state_out,
+                    jacobian_resist_dparam, jacobian_react_dparam)
 
-        Or (if cache is not split):
-            eval_fn(shared_params, device_params, cache, simparams[, limit_funcs])
-                -> (res_resist, res_react, jac_resist, jac_react,
-                    lim_rhs_resist, lim_rhs_react,
-                    small_signal_resist, small_signal_react)
+        The last two are the 2nd-order ∂jac/∂θ arrays, shape (n_jac_entries, n_params); empty
+        (n_jac_entries, 0) unless the OPENVAF_2ND_ORDER feature was enabled. VASAX Step 3.2 Layer 3.
 
         Should be vmapped with in_axes=(None, 0, None, 0) for split cache
         or in_axes=(None, 0, 0) for unsplit cache.
@@ -1398,6 +1400,9 @@ class OpenVAFToJAX:
             "node_indices": node_indices,
             "jacobian_keys": jacobian_keys,
             "jacobian_indices": jacobian_indices,
+            # θ axis for the eval_fn's 2nd-order jacobian_{resist,react}_dparam outputs
+            # (empty unless the OPENVAF_2ND_ORDER feature was enabled). VASAX Step 3.2 Layer 3.
+            "param_jacobian_param_names": self.dae_data.get("param_jacobian_param_names", []),
             "terminals": self.dae_data["terminals"],
             "internal_nodes": self.dae_data["internal_nodes"],
             "num_terminals": self.dae_data["num_terminals"],
