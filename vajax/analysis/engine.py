@@ -1974,6 +1974,104 @@ class CircuitEngine:
 
         return Jr, Jc
 
+    def _extract_ac_jacobian_dparams(
+        self,
+        V: Array,
+        vmapped_fns: Dict[str, Callable],
+        static_inputs_cache: Dict[str, Tuple],
+        source_device_data: Dict[str, Any],
+        n_unknowns: int,
+        vsource_dc_vals: Array,
+        isource_dc_vals: Array,
+        shared_cache_override: "Optional[Dict[str, Array]]" = None,
+    ) -> Dict[str, Tuple[Array, Array]]:
+        """Analytic ``(∂Jr/∂θ, ∂Jc/∂θ)`` at ``V`` — the 2nd-order sibling of
+        :meth:`_extract_ac_jacobians` (VASAX Step 3.2 Layer 4).
+
+        Reads the eval's 2nd-order slots [9] ``jacobian_resist_dparam`` / [10]
+        ``jacobian_react_dparam`` (shape ``(n_dev, n_entries, n_params)``; the θ axis is that model's
+        ``param_jacobian_param_names``, non-empty only when the ``OPENVAF_2ND_ORDER`` feature was
+        enabled at compile). Each θ-column is scattered into a dense ``n_unknowns × n_unknowns``
+        matrix through the **same** ``jac_row/col_indices`` COO maps + NaN mask as the value path.
+
+        Returns ``{model_type: (dJr, dJc)}`` where each is ``(n_params, n_unknowns, n_unknowns)`` in
+        global node space; models with no 2nd-order params are omitted. The constant-G vsource block
+        and the ``1e-12·I`` regularizer are θ-independent, so they are **not** included (their
+        derivative is zero). Analytic (a forward device eval + segment_sum) — no AD over the eval.
+        """
+        result: Dict[str, Tuple[Array, Array]] = {}
+        for model_type in static_inputs_cache.keys():
+            voltage_indices, stamp_indices, voltage_node1, voltage_node2, cache, _ = (
+                static_inputs_cache[model_type]
+            )
+            voltage_updates = V[voltage_node1] - V[voltage_node2]
+
+            compiled = self._compiled_models[model_type]
+            uses_analysis = compiled.get("uses_analysis", False)
+            uses_simparam_gmin = compiled.get("uses_simparam_gmin", False)
+            shared_params = compiled["shared_params"]
+            device_params = compiled["device_params"]
+            voltage_positions = compiled["voltage_positions_in_varying"]
+            vmapped_split_eval = compiled["vmapped_split_eval"]
+            shared_cache = (
+                shared_cache_override[model_type]
+                if shared_cache_override is not None and model_type in shared_cache_override
+                else compiled["shared_cache"]
+            )
+            default_simparams = compiled.get("default_simparams", jnp.array([0.0, 1.0, 1e-12]))
+
+            device_params_updated = device_params.at[:, voltage_positions].set(voltage_updates)
+            if uses_analysis:
+                device_params_updated = device_params_updated.at[:, -2].set(1.0)
+                device_params_updated = device_params_updated.at[:, -1].set(1e-12)
+            elif uses_simparam_gmin:
+                device_params_updated = device_params_updated.at[:, -1].set(1e-12)
+            simparams = default_simparams.at[0].set(1.0).at[2].set(1e-12)  # AC=1, gmin=1e-12
+
+            num_limit_states = compiled.get("num_limit_states", 0)
+            n_devices = device_params.shape[0]
+            n_lim = max(1, num_limit_states)
+            model_limit_state_in = jnp.zeros((n_devices, n_lim), dtype=get_float_dtype())
+
+            # Separate eval call keeping slots [9]/[10] (the value path discards them).
+            out = vmapped_split_eval(
+                shared_params, device_params_updated, shared_cache, cache, simparams,
+                model_limit_state_in,
+            )
+            batch_dr = out[9]  # (n_dev, n_entries, n_params)
+            batch_dc = out[10]
+            n_params = batch_dr.shape[-1]
+            if n_params == 0:
+                continue  # model carries no 2nd-order params — nothing to contribute
+
+            jac_row_idx = stamp_indices["jac_row_indices"]
+            jac_col_idx = stamp_indices["jac_col_indices"]
+            flat_jac_rows = jac_row_idx.ravel()
+            flat_jac_cols = jac_col_idx.ravel()
+            valid_jac = (flat_jac_rows >= 0) & (flat_jac_cols >= 0)
+            flat_indices = (
+                jnp.where(valid_jac, flat_jac_rows, 0) * n_unknowns
+                + jnp.where(valid_jac, flat_jac_cols, 0)
+            )
+
+            def assemble_one(vals_p):  # vals_p (n_dev*n_entries,) -> (n_unknowns, n_unknowns)
+                masked = jnp.where(valid_jac, vals_p, 0.0)
+                masked = jnp.where(jnp.isnan(masked), 0.0, masked)
+                flat = jax.ops.segment_sum(
+                    masked, flat_indices, num_segments=n_unknowns * n_unknowns
+                )
+                return flat.reshape((n_unknowns, n_unknowns))
+
+            # (n_dev, n_entries, n_params) -> (n_params, n_dev*n_entries), row-major parallel to the
+            # value jac (entry i lines up with jacobian[i]), then vmap the scatter over the θ axis.
+            dr_by_p = batch_dr.reshape(-1, n_params).T
+            dc_by_p = batch_dc.reshape(-1, n_params).T
+            dJr = jax.vmap(assemble_one)(dr_by_p)  # (n_params, n_unknowns, n_unknowns)
+            dJc = jax.vmap(assemble_one)(dc_by_p)
+            result[model_type] = (dJr, dJc)
+
+        return result
+
     def _extract_ac_sources(self) -> List[Dict]:
         """Extract AC source specifications from devices."""
         from vajax.analysis.ac import extract_ac_sources

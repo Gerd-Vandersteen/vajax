@@ -1168,6 +1168,9 @@ def prepare_static_inputs(
         compiled["default_simparams"] = default_simparams
         compiled["simparams_used"] = simparams_used
         compiled["simparam_indices"] = split_meta.get("simparam_indices", {})
+        # θ axis of the eval's 2nd-order jacobian_{resist,react}_dparam slots (empty unless the
+        # OPENVAF_2ND_ORDER feature was enabled at compile). VASAX Step 3.2 Layer 4.
+        compiled["param_jacobian_param_names"] = split_meta.get("param_jacobian_param_names", [])
         compiled["use_device_limiting"] = use_device_limiting
         compiled["limit_param_map"] = limit_param_map
 
