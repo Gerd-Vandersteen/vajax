@@ -1808,6 +1808,7 @@ class CircuitEngine:
         vsource_dc_vals: Array,
         isource_dc_vals: Array,
         shared_cache_override: "Optional[Dict[str, Array]]" = None,
+        shared_params_override: "Optional[Dict[str, Array]]" = None,
     ) -> Tuple[Array, Array]:
         """Extract resistive and reactive Jacobians at given operating point.
 
@@ -1864,7 +1865,18 @@ class CircuitEngine:
             uses_analysis = compiled.get("uses_analysis", False)
             uses_simparam_gmin = compiled.get("uses_simparam_gmin", False)
 
-            shared_params = compiled["shared_params"]
+            # Eval-direct params kept LIVE (openvaf_models.LIVE_EVAL_PARAMS, e.g. ASM-HEMT
+            # voff/u0/vsat) are captured as 0 in the baseline shared_params and supplied at runtime
+            # via shared_params_override — the same seam build_system_mna uses. Without it the AC
+            # eval runs the device with those params zeroed (u0=0 → no channel), so jac_resist has no
+            # gm/gds and the small-signal Jr is degenerate (|H| purely capacitive). No-op for models
+            # with no live-eval leaf tuned (BSIM4/EKV → override is None).
+            shared_params = (
+                shared_params_override[model_type]
+                if shared_params_override is not None
+                and model_type in shared_params_override
+                else compiled["shared_params"]
+            )
             device_params = compiled["device_params"]
             voltage_positions = compiled["voltage_positions_in_varying"]
             vmapped_split_eval = compiled["vmapped_split_eval"]
