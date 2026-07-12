@@ -379,7 +379,10 @@ class FunctionBuilder:
 
         For an exited/converged iteration the freeze reproduces the carry exactly, so the
         scan's final state equals the while-loop's whenever N >= the real trip count
-        (idempotent fixed points; predicate-gated accumulators).
+        (idempotent fixed points; predicate-gated accumulators). Reverse-mode ``0*inf`` NaNs come
+        from inf-valued intermediates in the model's own overflow guards (e.g. ``exp``), which are
+        hardened at the op level (``instruction.py``), not here — the converged frozen carry is
+        in-domain, so the freeze itself needs no extra reverse guard (KB §7 BSIM4 reverse-DC).
         """
         multi = len(loop_state) > 1
 

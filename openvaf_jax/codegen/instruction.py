@@ -222,6 +222,8 @@ class InstructionTranslator:
         # Power (gradient-safe: jnp.power has a NaN gradient for base < 0)
         if opcode == "pow":
             return self._translate_pow(inst)
+        if opcode == "exp":
+            return self._translate_exp(inst)
 
         # Unary jnp functions
         if opcode in self.UNARY_JNP_SAME:
@@ -399,6 +401,22 @@ class InstructionTranslator:
 
     # Small floor shared by the log lowerings; log(EPS) is the masked-branch value.
     _LOG_EPS = 1e-300
+
+    def _translate_exp(self, inst: MIRInstruction) -> ast.expr:
+        """Translate exp, gradient-safe against overflow.
+
+        ``jnp.exp(x)`` overflows to ``inf`` for ``x > ~709`` (float64). When such an exp is masked
+        by a downstream ``where`` — e.g. BSIM4's exp-overflow guard ``where(arg < 34, series, exp-
+        form)`` — the *value* is fine (forward selects the finite branch) but reverse mode routes a
+        zero cotangent into the ``inf`` exp's derivative → ``0*inf = NaN`` (forward mode selects and
+        is immune). Clamping the argument keeps exp finite (max ~8e307) so its reverse gradient is
+        finite. Value-identical for every result that isn't already ``inf``: an unclamped ``x > 709``
+        yields ``inf`` and could only reach a masked/broken path (a finite cache never observes it).
+        This is the KB §2-fix-1 double-``where`` idea applied to overflow (KB §7 BSIM4 reverse-DC).
+        """
+        operand = self.ctx.get_operand(inst.operands[0])
+        safe = jnp_call("minimum", operand, ast_const(709.0))
+        return jnp_call("exp", safe)
 
     def _translate_ln(self, inst: MIRInstruction) -> ast.expr:
         """Translate natural log, gradient-safe for x <= eps.

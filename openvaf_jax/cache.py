@@ -162,12 +162,18 @@ def compute_va_hash(va_path: Path) -> str:
     changes the emitted eval (it adds the dparam arrays), so its compiles must not collide with
     the default ones in the persistent cache. When the feature is off the hash is unchanged, so
     existing (feature-off) caches stay valid. (VASAX Step 3.2)
+
+    OPENVAF_DIFFERENTIABLE_LOOPS is folded in the same way: it switches the split-init's counted
+    loops from ``lax.while_loop`` to a reverse-mode-transposable ``lax.scan`` (needed for BSIM4
+    ``jacrev`` DC sensitivity, KB §7). Off ⇒ hash unchanged ⇒ existing caches stay valid.
     """
     content = va_path.read_bytes()
     h = hashlib.sha256(content)
     if os.environ.get("OPENVAF_2ND_ORDER") is not None:
         h.update(b"|2nd_order:")
         h.update(os.environ.get("OPENVAF_2ND_ORDER_PARAMS", "w,l").encode())
+    if os.environ.get("OPENVAF_DIFFERENTIABLE_LOOPS") is not None:
+        h.update(b"|diff_loops")
     return h.hexdigest()[:16]
 
 
