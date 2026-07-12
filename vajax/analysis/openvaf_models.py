@@ -595,6 +595,16 @@ def compile_openvaf_models(
             "uses_simparam_gmin": translator.uses_simparam_gmin,
             "uses_analysis": translator.uses_analysis,
             "analysis_type_map": translator.analysis_type_map,
+            # Node-collapse decision->pair map (openvaf_jax `_emit_collapse_decisions` ordering).
+            # Copied from the TRANSLATOR, which carries it reliably on both the fresh compile
+            # (`OpenVAFToJAX.__init__`) and the persistent-cache load (`from_cache`, __init__.py:173)
+            # -- unlike the local `module`, which is None on the cache path (line 456/463). Without
+            # this, `_resolve_collapse_decision_outputs` finds nothing and the collapse fix
+            # (`_pairs_from_collapse_decisions`) silently degrades to the WRONG positional map for any
+            # model whose #decision-outputs != #collapsible-pairs (ASM-HEMT: 12 vs 11 -> the extra
+            # guard shifts every later index -> the drain di->d collapse is dropped -> the intrinsic
+            # drain floats -> Id pinned at gmin, "does not conduct", KB §1227).
+            "collapse_decision_outputs": list(getattr(translator, "collapse_decision_outputs", []) or []),
         }
 
         compiled_models[model_type] = compiled
