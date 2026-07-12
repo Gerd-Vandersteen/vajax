@@ -933,9 +933,20 @@ def prepare_static_inputs(
 
         num_terminals = len(va_terminals)
         for i, va_name in enumerate(va_internal):
-            internal_key = f"node{num_terminals + i}"
-            if internal_key in internal_nodes:
-                node_map[va_name] = internal_nodes[internal_key]
+            # `device_internal_nodes` (internal_nodes) is keyed by the model's REAL node names
+            # (`model_nodes`). Most internals are "node<k>", but special unknowns are named
+            # otherwise -- a branch-current unknown "br[Unnamed{...}]" (a flow() output) or an
+            # implicit-equation unknown "inode0". Index `model_nodes` positionally instead of
+            # assuming a "node<k>" key; otherwise those nodes never map, so
+            # `build_stamp_index_mapping` drops every jacobian_key/residual row touching them (-> the
+            # nodes float). For ASM-HEMT that silently un-stamps `flow(di,si)` and the
+            # surface-potential `implicit_equation_0`, so the channel is unsolved and Id pins at gmin
+            # ("does not conduct", KB §1227). Byte-identical for all-"node<k>" models (BSIM4/EKV).
+            internal_pos = num_terminals + i
+            if internal_pos < len(model_nodes):
+                model_node_name = model_nodes[internal_pos]
+                if model_node_name in internal_nodes:
+                    node_map[va_name] = internal_nodes[model_node_name]
 
         # Pre-compute voltage node pairs
         voltage_node_pairs = []
