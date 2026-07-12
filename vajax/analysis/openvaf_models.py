@@ -828,6 +828,38 @@ def prepare_static_inputs(
             voltage_indices.append(i)
             voltage_set.add(i)
 
+    # --- Branch-current / implicit-equation unknowns fed from the solution vector ---
+    # Most models are voltage-only, but implicit / surface-potential models (ASM-HEMT) carry extra
+    # MNA unknowns the eval reads as a `current` input (a flow() branch current) or an
+    # `implicit_unknown` input. Unless each is fed the *current* solution value every NR step, the
+    # residual can't depend on it: ASM-HEMT's `res[flow(di,si)] = Ich - flow` reads `flow` as a
+    # constant 0, so Newton can never drive it to Ich and the channel current never reaches the
+    # drain (Id pins at gmin — "does not conduct", KB §1227). The eval already emits the right
+    # structural Jacobian (∂res_flow/∂flow=-1, the di/si incidence ±1) — only the residual's
+    # value-dependence is missing. Route each such unknown through the SAME path as a voltage read
+    # `V[unknown_idx] - V[ground]`: give it a (unknown_mna_idx, ground) node pair and treat it as a
+    # varying column. Making it *varying* also keeps it out of SCCP folding (only shared params are
+    # folded, below), so the eval genuinely reads it instead of a baked-in 0. No-op for voltage-only
+    # models (BSIM4/EKV expose no `current`/`implicit_unknown` params → unknown_specs stays empty).
+    _meta = compiled.get("dae_metadata", {})
+    _internal_dae = _meta.get("internal_nodes", [])
+    _current_by_name = {param_names[i]: i for i, k in enumerate(param_kinds) if k == "current"}
+    # (eval_param_idx, node_map_key); node_map_key resolves to the MNA index via the per-device
+    # node_map built below (populated with both model-node and VA names).
+    unknown_specs: List[Tuple[int, str]] = []
+    # (a) flow() branch currents: dae internal name "flow(X,Y)" <-> current param "I(X,Y)".
+    for dae_name in _internal_dae:
+        if dae_name.startswith("flow(") and dae_name.endswith(")"):
+            cur_idx = _current_by_name.get("I" + dae_name[len("flow"):])  # flow(di,si)->I(di,si)
+            if cur_idx is not None:
+                unknown_specs.append((cur_idx, dae_name))
+    # (b) implicit-equation unknowns: the `implicit_unknown` param name equals its model-node name
+    # (e.g. "inode0"), which node_map maps to the implicit MNA row.
+    for i, kind in enumerate(param_kinds):
+        if kind == "implicit_unknown":
+            unknown_specs.append((i, param_names[i]))
+    unknown_indices = [idx for idx, _ in unknown_specs]
+
     n_devices = len(openvaf_devices)
     n_params = len(param_names)
     device_contexts = []
@@ -835,6 +867,7 @@ def prepare_static_inputs(
     # Build col_values: col_idx -> scalar (shared) or array (varying)
     col_values: Dict[int, Any] = {}
     varying_cols_set = set(voltage_set)
+    varying_cols_set.update(unknown_indices)  # branch/implicit unknowns -> varying (fed per-NR)
 
     if n_devices > 0:
         all_dev_params = [dev["params"] for dev in openvaf_devices]
@@ -954,6 +987,13 @@ def prepare_static_inputs(
             name = param_names[idx]
             node_pair = parse_voltage_param_fn(name, node_map, model_nodes, ground)
             voltage_node_pairs.append(node_pair)
+        # Branch/implicit unknowns: read straight from the solution vector as V[idx] - V[ground].
+        # Kept in lock-step with the voltage_indices extension below (same order → same device_params
+        # columns via voltage_positions). node_map maps the branch dae name ("flow(di,si)") and the
+        # implicit param name ("inode0") to their MNA rows; an unmapped key falls back to ground
+        # (feeds 0, i.e. the pre-fix behaviour) rather than crashing.
+        for _param_idx, node_map_key in unknown_specs:
+            voltage_node_pairs.append((node_map.get(node_map_key, ground), ground))
 
         device_contexts.append(
             {
@@ -1167,7 +1207,10 @@ def prepare_static_inputs(
         default_simparams = jnp.array(default_simparams_list, dtype=get_float_dtype())
         logger.info(f"{model_type}: simparams_used={simparams_used}, count={simparam_count}")
 
-        # Voltage positions in device_params
+        # Voltage positions in device_params. Fold the branch/implicit unknowns in here so they ride
+        # the exact same per-NR feed path as voltages (see unknown_specs above); order matches the
+        # pairs appended to voltage_node_pairs, so column k of voltage_positions ↔ pair k.
+        voltage_indices = list(voltage_indices) + unknown_indices
         varying_idx_to_pos = {orig_idx: pos for pos, orig_idx in enumerate(varying_indices_list)}
         voltage_positions = [
             varying_idx_to_pos[v] for v in voltage_indices if v in varying_idx_to_pos
