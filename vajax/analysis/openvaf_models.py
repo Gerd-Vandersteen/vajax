@@ -599,11 +599,13 @@ def compile_openvaf_models(
             # Copied from the TRANSLATOR, which carries it reliably on both the fresh compile
             # (`OpenVAFToJAX.__init__`) and the persistent-cache load (`from_cache`, __init__.py:173)
             # -- unlike the local `module`, which is None on the cache path (line 456/463). Without
-            # this, `_resolve_collapse_decision_outputs` finds nothing and the collapse fix
-            # (`_pairs_from_collapse_decisions`) silently degrades to the WRONG positional map for any
-            # model whose #decision-outputs != #collapsible-pairs (ASM-HEMT: 12 vs 11 -> the extra
-            # guard shifts every later index -> the drain di->d collapse is dropped -> the intrinsic
-            # drain floats -> Id pinned at gmin, "does not conduct", KB §1227).
+            # this, `_resolve_collapse_decision_outputs` finds nothing and
+            # `_pairs_from_collapse_decisions` silently degrades to the WRONG positional map for any
+            # model whose #decision-outputs != #collapsible-pairs (every real model: multiple guards
+            # per pair + extra/implicit-pair entries). Entries are (pair_idx, conjuncts) since
+            # collapse_guards:2 — pair_idx is the TRUE CollapsePair index (openvaf_py resolves each
+            # CollapseHint through node_collapse.hint(); the pre-fix sequential-counter desync that
+            # shifted ASM-HEMT's guards, KB §1227, is gone).
             "collapse_decision_outputs": list(getattr(translator, "collapse_decision_outputs", []) or []),
         }
 
@@ -614,13 +616,15 @@ def compile_openvaf_models(
     return compiled_models
 
 
-def _resolve_collapse_decision_outputs(compiled: Dict[str, Any]) -> List[Tuple[int, str]]:
-    """The ``(pair_idx, decision_var)`` list that orders ``init_fn``'s collapse outputs.
+def _resolve_collapse_decision_outputs(compiled: Dict[str, Any]) -> List[Tuple[int, Any]]:
+    """The ``(pair_idx, conjuncts)`` list that orders ``init_fn``'s collapse outputs.
 
     ``init_fn`` emits ONE collapse value per entry of ``collapse_decision_outputs``, in that
-    order (openvaf_jax ``_emit_collapse_decisions``). The list is on the compiled VaModule; the
-    vajax ``compiled_models`` dict does not always copy it, so fall back to the module. Empty if
-    unavailable (callers then use positional mapping).
+    order (openvaf_jax ``_emit_collapse_decisions`` — since collapse_guards:2 each entry's
+    second element is the conjunct list ``[(vN, negate), ...]``; only the pair_idx matters
+    here). The list is on the compiled VaModule; the vajax ``compiled_models`` dict does not
+    always copy it, so fall back to the module. Empty if unavailable (callers then use
+    positional mapping).
     """
     cdo = compiled.get("collapse_decision_outputs")
     if not cdo:
@@ -633,13 +637,14 @@ def _resolve_collapse_decision_outputs(compiled: Dict[str, Any]) -> List[Tuple[i
 def _pairs_from_collapse_decisions(
     collapse_decisions: Any,
     collapsible_pairs: List[Tuple[int, int]],
-    collapse_decision_outputs: List[Tuple[int, str]],
+    collapse_decision_outputs: List[Tuple[int, Any]],
 ) -> List[Tuple[int, int]]:
     """Map ``init_fn``'s collapse-decision array to the collapsible pairs that fire.
 
-    ``init_fn`` returns one value per ``collapse_decision_outputs`` entry ``(pair_idx, var)``,
-    in that order. A single pair may have SEVERAL decision outputs (BSIM4's gate ``gi->gm`` and
-    body ``bi->b`` each have two guards): the pair collapses if ANY of its guards fires (OR).
+    ``init_fn`` returns one value per ``collapse_decision_outputs`` entry ``(pair_idx,
+    conjuncts)``, in that order. A single pair may have SEVERAL decision outputs (BSIM4's gate
+    ``gi->gm`` and body ``bi->b`` each have two guards; extra branch-current pairs mirror every
+    guard of their source pair): the pair collapses if ANY of its guards fires (OR).
 
     The naive ``collapse[i] > 0.5 -> collapsible_pairs[i]`` mapping is WRONG whenever a pair has
     more than one output — the duplicates shift every later index, so e.g. BSIM4 wrongly kept

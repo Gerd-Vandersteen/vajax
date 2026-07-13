@@ -61,8 +61,12 @@ class VaModule:
     num_collapsible: int
     """Number of collapsible pairs."""
 
-    collapse_decision_outputs: List[Tuple[int, str]]
-    """Collapse decision outputs: (pair_index, decision_variable)."""
+    collapse_decision_outputs: List[Tuple[int, List[Tuple[str, bool]]]]
+    """Collapse guards: (pair_index, [(value_name, negate), ...]).
+
+    The pair collapses when ALL conjuncts hold ([] = unconditional); several
+    entries for the same pair OR together. pair_index indexes collapsible_pairs.
+    """
 
     # OSDI metadata
     num_terminals: int

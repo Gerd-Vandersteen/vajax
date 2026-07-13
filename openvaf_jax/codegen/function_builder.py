@@ -574,14 +574,17 @@ class InitFunctionBuilder(FunctionBuilder):
         self,
         mir_func: MIRFunction,
         cache_mapping: List[Dict[str, Any]],
-        collapse_decision_outputs: List[Tuple[int, str]],
+        collapse_decision_outputs: List[Tuple[int, Any]],
     ):
         """Initialize init function builder.
 
         Args:
             mir_func: Parsed init MIR function
             cache_mapping: List of {init_value, eval_param} mappings
-            collapse_decision_outputs: List of (pair_idx, value_name) tuples
+            collapse_decision_outputs: List of (pair_idx, conjuncts) entries where
+                conjuncts is [(value_name, negate), ...] — the pair collapses when
+                ALL conjuncts hold ([] = unconditional). The pre-collapse_guards:2
+                shape (pair_idx, "vN"/"!vN") is still accepted (_normalize_guard).
         """
         super().__init__(mir_func)
         self.cache_mapping = cache_mapping
@@ -833,27 +836,58 @@ class InitFunctionBuilder(FunctionBuilder):
         else:
             body.append(assign("cache", jnp_call("array", list_expr([]))))
 
+    @staticmethod
+    def _normalize_guard(entry) -> Tuple[int, List[Tuple[str, bool]]]:
+        """Return (pair_idx, [(value_name, negate), ...]) for old- or new-shape entries.
+
+        New shape (collapse_guards:2): (pair_idx, [(vN, negate), ...]) — a conjunction,
+        [] == unconditional. Old shape: (pair_idx, "vN" | "!vN") — a single condition
+        with the negation as a string prefix. Kept so an old pickled mir_data.pkl fails
+        soft (the compute_va_hash schema salt retires those caches anyway). Tuples may
+        arrive as lists after a JSON round-trip — normalize both.
+        """
+        pair_idx, guard = entry
+        if isinstance(guard, str):
+            if guard.startswith("!"):
+                return pair_idx, [(guard[1:], True)]
+            return pair_idx, [(guard, False)]
+        return pair_idx, [(str(name), bool(neg)) for name, neg in guard]
+
     def _emit_collapse_decisions(self, body: List[ast.stmt], ctx: CodeGenContext):
-        """Emit collapse decision array construction."""
+        """Emit collapse decision array construction.
+
+        One float per entry, in list order: the AND of the entry's conjuncts (negation
+        via jnp.logical_not). Per-conjunct missing-var defaults keep the pre-conjunction
+        semantics: a missing negated var counts as True (drops out of the AND), a
+        missing non-negated var counts as False (zeroes the whole entry).
+        """
         collapse_vals: List[ast.expr] = []
 
-        for pair_idx, val_name in self.collapse_decision_outputs:
-            if val_name.startswith("!"):
-                actual_val = val_name[1:]
-                negate = True
-            else:
-                actual_val = val_name
-                negate = False
+        for entry in self.collapse_decision_outputs:
+            _pair_idx, conjuncts = self._normalize_guard(entry)
+            term_exprs: Optional[List[ast.expr]] = []
+            for actual_val, negate in conjuncts:
+                var_name = f"{ctx.var_prefix}{actual_val}"
+                if var_name in ctx.defined_vars or actual_val in ctx.defined_vars:
+                    val_expr = ast_name(var_name if var_name in ctx.defined_vars else actual_val)
+                    if negate:
+                        val_expr = jnp_call("logical_not", val_expr)
+                    term_exprs.append(val_expr)
+                elif not negate:
+                    term_exprs = None  # missing non-negated conjunct -> entry is 0.0
+                    break
+                # missing negated conjunct -> True -> drops out of the AND
 
-            var_name = f"{ctx.var_prefix}{actual_val}"
-            if var_name in ctx.defined_vars or actual_val in ctx.defined_vars:
-                val_expr = ast_name(var_name if var_name in ctx.defined_vars else actual_val)
-                if negate:
-                    val_expr = jnp_call("logical_not", val_expr)
-                collapse_vals.append(ast_call(attr(ast_name("jnp"), "float32"), [val_expr]))
+            if term_exprs is None:
+                collapse_vals.append(ctx.zero())
+            elif not term_exprs:
+                # unconditional hint (or every conjunct defaulted True) -> collapse
+                collapse_vals.append(ctx.one())
             else:
-                # Default based on negation
-                collapse_vals.append(ctx.one() if negate else ctx.zero())
+                expr = term_exprs[0]
+                for term in term_exprs[1:]:
+                    expr = jnp_call("logical_and", expr, term)
+                collapse_vals.append(ast_call(attr(ast_name("jnp"), "float32"), [expr]))
 
         if collapse_vals:
             body.append(assign("collapse_decisions", jnp_call("array", list_expr(collapse_vals))))

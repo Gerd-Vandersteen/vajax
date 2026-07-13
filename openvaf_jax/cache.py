@@ -166,9 +166,17 @@ def compute_va_hash(va_path: Path) -> str:
     OPENVAF_DIFFERENTIABLE_LOOPS is folded in the same way: it switches the split-init's counted
     loops from ``lax.while_loop`` to a reverse-mode-transposable ``lax.scan`` (needed for BSIM4
     ``jacrev`` DC sensitivity, KB §7). Off ⇒ hash unchanged ⇒ existing caches stay valid.
+
+    An UNCONDITIONAL schema salt is also folded in, bumped whenever the extraction schema
+    baked into cached artifacts changes. ``collapse_guards:2``: openvaf_py's collapse
+    decisions became (pair_idx, [(vN, negate), ...]) with corrected pair indices and
+    guards for extra/implicit pairs — both the pickled ``mir_data.pkl`` (translator cache
+    includes ``collapse_decision_outputs``) and the generated ``init_fn.py`` bake the old
+    shape/decisions in, so all pre-fix cache entries must be retired at once.
     """
     content = va_path.read_bytes()
     h = hashlib.sha256(content)
+    h.update(b"|collapse_guards:2")
     if os.environ.get("OPENVAF_2ND_ORDER") is not None:
         h.update(b"|2nd_order:")
         h.update(os.environ.get("OPENVAF_2ND_ORDER_PARAMS", "w,l").encode())

@@ -187,10 +187,16 @@ struct VaModule {
     /// Number of collapsible pairs
     #[pyo3(get)]
     num_collapsible: usize,
-    /// Collapse decision outputs: (eq_index, value_name)
-    /// Maps equation indices to the init function output values that control collapse
+    /// Collapse decision guards: (pair_index, [(value_name, negate), ...]).
+    /// The pair at `pair_index` (an index into `collapsible_pairs`) collapses when ALL
+    /// conjuncts hold; a conjunct holds when the init MIR bool `value_name` ("v{N}") is
+    /// true (negate=false) or false (negate=true). Empty conjuncts = unconditional.
+    /// A pair may have several entries (one per CollapseHint call site, plus mirrored
+    /// entries for the extra branch-current pairs that collapse alongside it); it
+    /// collapses when ANY entry's conjunction holds (OR of ANDs, reduced Python-side
+    /// in `_pairs_from_collapse_decisions`).
     #[pyo3(get)]
-    collapse_decision_outputs: Vec<(u32, String)>,
+    collapse_decision_outputs: Vec<(u32, Vec<(String, bool)>)>,
 
     // Parameter defaults support
     /// Default values for parameters (extracted from Verilog-A source)
@@ -765,7 +771,7 @@ impl VaModule {
     ///       - pair_idx: Index of this collapse pair
     ///       - node1_idx, node2_idx: SimUnknown indices (node2=MAX means ground)
     ///       - node1_name, node2_name: VA node names ('G' -> 'GP')
-    ///       - decision_var: MIR variable controlling collapse ('!v3729')
+    ///       - decision_var: guard expression ('!v100 & !v119' or 'v22 | !v408')
     ///   - 'num_collapsible': Number of collapsible pairs
     ///
     /// The MIR variable names (resist_var, react_var) reference values computed
@@ -918,10 +924,29 @@ impl VaModule {
                 pair_dict.set_item("node1_name", n1_name).unwrap();
                 pair_dict.set_item("node2_name", n2_name).unwrap();
 
-                // Include the collapse decision variable if available
-                if let Some((_, decision_var)) = self.collapse_decision_outputs.iter()
-                    .find(|(idx, _)| *idx == i as u32) {
-                    pair_dict.set_item("decision_var", decision_var).unwrap();
+                // Include the collapse guard(s) if available (diagnostic only — no
+                // Python code parses this). Conjuncts join with " & ", multiple
+                // guards for the same pair OR together with " | ".
+                let guards: Vec<String> = self
+                    .collapse_decision_outputs
+                    .iter()
+                    .filter(|(idx, _)| *idx == i as u32)
+                    .map(|(_, conjuncts)| {
+                        if conjuncts.is_empty() {
+                            "true".to_string()
+                        } else {
+                            conjuncts
+                                .iter()
+                                .map(|(name, neg)| {
+                                    if *neg { format!("!{}", name) } else { name.clone() }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" & ")
+                        }
+                    })
+                    .collect();
+                if !guards.is_empty() {
+                    pair_dict.set_item("decision_var", guards.join(" | ")).unwrap();
                 }
 
                 collapsible_list.append(pair_dict).unwrap();
@@ -1589,70 +1614,120 @@ fn compile_va(path: &str, allow_analog_in_cond: bool, allow_builtin_primitives: 
             .collect();
         let num_collapsible = collapsible_pairs.len();
 
-        // Extract collapse decision outputs from init function
-        // These are the boolean values that determine which pairs actually collapse at runtime
-        // Format: Vec<(pair_index, value_name, negate)> where:
-        //   - pair_index: index into collapsible_pairs
-        //   - value_name: the condition variable (e.g., "v3729")
-        //   - negate: true if collapse happens when condition is FALSE
-        let mut collapse_decision_outputs: Vec<(u32, String)> = Vec::new();
+        // Extract collapse decision guards from the init function.
+        // See the field doc on `collapse_decision_outputs` for the encoding.
+        let mut collapse_decision_outputs: Vec<(u32, Vec<(String, bool)>)> = Vec::new();
 
         use hir_lower::CallBackKind;
 
-        // Build mapping from FuncRef to CollapseHint callback info
-        // CollapseHint callbacks are indexed in order in intern.callbacks
-        let mut collapse_hint_funcs: HashMap<mir::FuncRef, usize> = HashMap::new();
-        let mut collapse_hint_index = 0usize;
-        for (idx, kind) in compiled.init.intern.callbacks.iter().enumerate() {
-            if matches!(kind, CallBackKind::CollapseHint(_, _)) {
-                let func_ref = mir::FuncRef::from(idx as u32);
-                collapse_hint_funcs.insert(func_ref, collapse_hint_index);
-                collapse_hint_index += 1;
+        // Map each CollapseHint callback to its TRUE CollapsePair indices, mirroring
+        // osdi/src/setup.rs: resolve the hir nodes to SimUnknowns exactly like
+        // NodeCollapse::new(), then let hint() expand to the pair and its extra pairs
+        // (branch-current unknowns that collapse alongside it).
+        // NOTE: intern.callbacks is a TiSet<FuncRef, CallBackKind>, so the enumeration
+        // index IS the FuncRef. A sequential counter over CollapseHint callbacks is NOT
+        // a valid pair index: node_collapse.pairs() inserts implicit-equation pairs
+        // first and dedups repeated (hi, lo) hints, so the counter desyncs (ASM-HEMT:
+        // implicit_equation_0 is pair 0, so every hint guard landed one pair too low
+        // and (g,gi) lost its guard entirely).
+        let mut collapse_hint_pairs: HashMap<mir::FuncRef, Vec<u32>> = HashMap::new();
+        for (func_ref, kind) in compiled.init.intern.callbacks.iter_enumerated() {
+            if let CallBackKind::CollapseHint(hi, lo) = *kind {
+                let hi = compiled
+                    .dae_system
+                    .unknowns
+                    .unwrap_index(&sim_back::SimUnknownKind::KirchoffLaw(hi));
+                let lo = lo.map(|lo| {
+                    compiled
+                        .dae_system
+                        .unknowns
+                        .unwrap_index(&sim_back::SimUnknownKind::KirchoffLaw(lo))
+                });
+                let mut pair_indices = Vec::new();
+                compiled.node_collapse.hint(hi, lo, |pair| pair_indices.push(u32::from(pair)));
+                collapse_hint_pairs.insert(func_ref, pair_indices);
             }
         }
 
-        // Find Call instructions to CollapseHint callbacks and their controlling conditions
-        // Strategy: For each Call to a CollapseHint, find the block it's in,
-        // then find the branch that targets that block
+        // For every CollapseHint call site, reconstruct the FULL guard conjunction by
+        // walking the CFG upward: while the current block has exactly one predecessor,
+        // a conditional branch terminating that predecessor is a condition every path
+        // to the call must satisfy. Stop at a join (>1 preds) or the entry block.
+        // This fixes compound guards (if / else-if / else chains): Angelov's
+        // `V(di,d) <+ 0.0` is only reached via !(Rd>0 || Rd2>0) && !(Ld>0); keeping
+        // only the branch that directly targets the call block drops the outer
+        // conjuncts, so the drain collapse fired even with Rd/Ld forming a real branch.
         let init_func = &compiled.init.func;
+        let init_cfg = mir::ControlFlowGraph::with_function(init_func);
+        let entry_block = init_func.layout.entry_block();
+        let num_blocks = init_func.layout.num_blocks();
 
-        // Build map of block -> instructions containing calls to CollapseHint
-        let mut callback_blocks: HashMap<mir::Block, Vec<(mir::FuncRef, usize)>> = HashMap::new();
         for block in init_func.layout.blocks() {
             for inst in init_func.layout.block_insts(block) {
-                if let mir::InstructionData::Call { func_ref, .. } = init_func.dfg.insts[inst] {
-                    if let Some(&hint_idx) = collapse_hint_funcs.get(&func_ref) {
-                        callback_blocks.entry(block).or_default().push((func_ref, hint_idx));
+                let func_ref = match init_func.dfg.insts[inst] {
+                    mir::InstructionData::Call { func_ref, .. } => func_ref,
+                    _ => continue,
+                };
+                let pair_indices = match collapse_hint_pairs.get(&func_ref) {
+                    Some(pairs) => pairs,
+                    None => continue,
+                };
+
+                let mut conjuncts: Vec<(String, bool)> = Vec::new();
+                let mut cur = block;
+                // Bounded to guard against (unreachable) CFG cycles.
+                for _ in 0..num_blocks {
+                    if Some(cur) == entry_block {
+                        break;
                     }
-                }
-            }
-        }
-
-        // For each block containing a CollapseHint call, find the branch that targets it
-        for block in init_func.layout.blocks() {
-            for inst in init_func.layout.block_insts(block) {
-                if let mir::InstructionData::Branch { cond, then_dst, else_dst, .. } = init_func.dfg.insts[inst] {
-                    // Check if either branch target contains a CollapseHint call
-                    // then_dst and else_dst are Block types directly
-                    for (target_block, is_true_branch) in [(then_dst, true), (else_dst, false)] {
-                        if let Some(callbacks) = callback_blocks.get(&target_block) {
-                            for &(_func_ref, hint_idx) in callbacks {
-                                // hint_idx corresponds to collapsible_pairs index
-                                let pair_idx = hint_idx as u32;
+                    let pred = match init_cfg.single_predecessor(cur) {
+                        Some(pred) if pred != cur => pred,
+                        _ => break, // join point or self-loop: no unique guard above
+                    };
+                    if let Some(term) = init_func.layout.last_inst(pred) {
+                        if let mir::InstructionData::Branch { cond, then_dst, else_dst, .. } =
+                            init_func.dfg.insts[term]
+                        {
+                            // A degenerate branch (both edges to `cur`) guards nothing;
+                            // otherwise `cur` is gated on cond (then edge) / !cond (else edge).
+                            if then_dst != else_dst {
                                 let cond_idx: u32 = cond.into();
-                                // If callback is on FALSE branch, collapse = NOT(cond)
-                                // We'll handle negation in Python by checking is_true_branch
-                                // For now, store condition with a prefix indicating if it needs negation
-                                let prefix = if is_true_branch { "" } else { "!" };
-                                collapse_decision_outputs.push((pair_idx, format!("{}v{}", prefix, cond_idx)));
+                                conjuncts.push((format!("v{}", cond_idx), else_dst == cur));
                             }
                         }
+                        // Jump terminators guard nothing; keep walking up.
                     }
+                    cur = pred;
+                }
+
+                for &pair_idx in pair_indices {
+                    collapse_decision_outputs.push((pair_idx, conjuncts.clone()));
                 }
             }
         }
 
-        // Sort by pair index for consistent ordering
+        // Implicit-equation pairs are controlled by a bool the init function computes
+        // as an OUTPUT (PlaceKind::CollapseImplicitEquation), not by a CollapseHint
+        // callback. Mirror osdi/src/setup.rs: emit that value as a single-conjunct
+        // guard, expanded through hint(). Without this, such pairs (e.g. ASM-HEMT's
+        // implicit_equation_0) would be reported unguarded and collapse always.
+        for (&kind, val) in compiled.init.intern.outputs.iter() {
+            if let PlaceKind::CollapseImplicitEquation(eq) = kind {
+                if let Some(val) = val.expand() {
+                    let eq = compiled
+                        .dae_system
+                        .unknowns
+                        .unwrap_index(&sim_back::SimUnknownKind::Implicit(eq));
+                    let guard = vec![(format!("v{}", u32::from(val)), false)];
+                    compiled.node_collapse.hint(eq, None, |pair| {
+                        collapse_decision_outputs.push((u32::from(pair), guard.clone()));
+                    });
+                }
+            }
+        }
+
+        // Sort by pair index for consistent ordering (stable: multiple guards of the
+        // same pair keep discovery order).
         collapse_decision_outputs.sort_by_key(|(idx, _)| *idx);
 
         // Extract parameter defaults from HIR
