@@ -673,13 +673,17 @@ class SSAAnalyzer:
 
         unique_vals = list(val_to_preds.keys())
 
-        # Optimization: If only one non-v3 value, use it directly
-        # v3 (constant 0.0) is often a placeholder for "unused" paths
-        # (e.g., PMOS values when running NMOS, or vice versa)
-        non_v3_vals = [v for v in unique_vals if str(v) != "v3"]
-        if len(non_v3_vals) == 1:
-            # All paths either compute this value or use v3 placeholder
-            return PHIResolution(type=PHIResolutionType.FALLBACK, single_value=non_v3_vals[0])
+        # A v3 (0.0) operand is NOT automatically a dead placeholder. For OpenVAF
+        # auto_diff DERIVATIVE phis, v3 is the true derivative (= 0.0) of branches that
+        # don't compute the value — e.g. BSIM4's EXP_THRESHOLD overflow guards,
+        # `where(arg < 34, exp_form, capped_linear)`: the capped branch's derivative is 0.
+        # An earlier fast path here collapsed any {v3, X} phi straight to X, dropping the
+        # guard: the exp branch's derivative (exp(arg), arg ~ 500+ in triode) then leaked
+        # UNGUARDED into jac_resist — BSIM4 gds/gm junk for Vds ≲ 0.75 and ±inf below
+        # ~0.42 → singular AC/HB systems (VASAX KB §7). So {v3, X} phis are resolved
+        # structurally like any other 2-value phi; the single-non-v3 collapse survives
+        # only as the LAST-RESORT fallback below (still the right guess for genuinely
+        # unresolvable type-split phis, e.g. PMOS values in an NMOS instance).
 
         # If only 2 unique values, try dominator-based TWO_WAY resolution
         if len(unique_vals) == 2:
@@ -699,7 +703,14 @@ class SSAAnalyzer:
         if resolution:
             return resolution
 
-        # Fallback to first value if tree building fails
+        # Fallback 1: single non-v3 value — v3 (constant 0.0) as a placeholder for
+        # never-taken paths (e.g. PMOS values when running NMOS). Only safe when no
+        # structured resolution exists; see the guard-dropping note above.
+        non_v3_vals = [v for v in unique_vals if str(v) != "v3"]
+        if len(non_v3_vals) == 1:
+            return PHIResolution(type=PHIResolutionType.FALLBACK, single_value=non_v3_vals[0])
+
+        # Fallback 2: first value if tree building fails
         return PHIResolution(
             type=PHIResolutionType.FALLBACK, single_value=phi.phi_operands[0].value
         )
