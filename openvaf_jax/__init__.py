@@ -277,6 +277,14 @@ class OpenVAFToJAX:
             "internal_nodes": self.dae_data["internal_nodes"],
             "num_terminals": self.dae_data["num_terminals"],
             "num_internal": self.dae_data["num_internal"],
+            # Per-source noise metadata (name/kind/node pair), in the same order as the eval's
+            # noise_pwr/exp/factor arrays (Phase 7b). Node names are model-local; the stamp builder
+            # maps them to global indices per instance. Empty for models with no noise sources.
+            "noise_sources": [
+                {"name": s["name"], "kind": s["kind"],
+                 "node1_name": s["node1_name"], "node2_name": s["node2_name"]}
+                for s in self.dae_data.get("noise_sources", [])
+            ],
         }
 
     def get_params(self, include_internal: bool = False) -> List[Dict]:

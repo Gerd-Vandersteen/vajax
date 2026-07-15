@@ -111,10 +111,29 @@ def build_stamp_index_mapping(
                 jac_row_indices[dev_idx, jac_idx] = row_idx - 1
                 jac_col_indices[dev_idx, jac_idx] = col_idx - 1
 
+    # Noise-source stamp indices (Phase 7b): per (device, source) global node pair, mirroring the
+    # jacobian mapping. node1/node2 are model-local names; "gnd" (or any name not in node_map) → -1
+    # (ground / skip). The eval's noise_pwr/exp/factor arrays are aligned to this same source order.
+    noise_sources = metadata.get("noise_sources", [])
+    n_noise = len(noise_sources)
+    noise_hi_indices = np.full((n_devices, n_noise), -1, dtype=np.int32)
+    noise_lo_indices = np.full((n_devices, n_noise), -1, dtype=np.int32)
+    for dev_idx, ctx in enumerate(device_contexts):
+        node_map = ctx["node_map"]
+        for src_idx, src in enumerate(noise_sources):
+            hi = node_map.get(src["node1_name"], None)
+            lo = node_map.get(src["node2_name"], None)
+            if hi is not None and hi != ground and hi > 0:
+                noise_hi_indices[dev_idx, src_idx] = hi - 1
+            if lo is not None and lo != ground and lo > 0:
+                noise_lo_indices[dev_idx, src_idx] = lo - 1
+
     return {
         "res_indices": jnp.array(res_indices),
         "jac_row_indices": jnp.array(jac_row_indices),
         "jac_col_indices": jnp.array(jac_col_indices),
+        "noise_hi_indices": jnp.array(noise_hi_indices),
+        "noise_lo_indices": jnp.array(noise_lo_indices),
     }
 
 
@@ -689,6 +708,9 @@ def make_mna_build_system_fn(
                 batch_limit_state_out,
                 _,  # jacobian_resist_dparam (VASAX Step 3.2 Layer 3)
                 _,  # jacobian_react_dparam
+                _,  # noise_pwr (Phase 7b noise channel)
+                _,  # noise_exp
+                _,  # noise_factor
             ) = split_info["vmapped_split_eval"](
                 (
                     shared_params_override[model_type]

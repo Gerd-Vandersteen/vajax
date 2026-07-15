@@ -177,6 +177,11 @@ def compute_va_hash(va_path: Path) -> str:
     content = va_path.read_bytes()
     h = hashlib.sha256(content)
     h.update(b"|collapse_guards:2")
+    # noise_channel:1 — openvaf_py's get_dae_system now emits `noise_sources` and the generated
+    # eval_fn returns a 14-tuple (appended noise_pwr/exp/factor slots, Phase 7b). Both the pickled
+    # mir_data.pkl and the generated eval_fn.py bake the old 11-tuple shape in, so all pre-noise
+    # cache entries must be retired at once.
+    h.update(b"|noise_channel:1")
     if os.environ.get("OPENVAF_2ND_ORDER") is not None:
         h.update(b"|2nd_order:")
         h.update(os.environ.get("OPENVAF_2ND_ORDER_PARAMS", "w,l").encode())

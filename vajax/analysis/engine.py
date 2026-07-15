@@ -1908,8 +1908,9 @@ class CircuitEngine:
             model_limit_state_in = jnp.zeros((n_devices, n_lim), dtype=get_float_dtype())
 
             # Uniform interface: always pass shared_cache, device_cache (cache), limit_state_in
-            # 11-tuple: trailing _, _ are the 2nd-order jac dparam arrays (VASAX Step 3.2 Layer 3)
-            _, _, batch_jac_resist, batch_jac_react, _, _, _, _, _, _, _ = vmapped_split_eval(
+            # 14-tuple: [9,10] are the 2nd-order jac dparam arrays (VASAX Step 3.2 Layer 3); the last
+            # three ([11,12,13]) are the Phase-7b noise channel (noise_pwr/exp/factor) — ignored here.
+            _, _, batch_jac_resist, batch_jac_react, _, _, _, _, _, _, _, _, _, _ = vmapped_split_eval(
                 shared_params,
                 device_params_updated,
                 shared_cache,
@@ -1985,6 +1986,104 @@ class CircuitEngine:
         Jr = Jr + 1e-12 * jnp.eye(n_unknowns, dtype=get_float_dtype())
 
         return Jr, Jc
+
+    def _extract_noise_sources(
+        self,
+        V: Array,
+        vmapped_fns: Dict[str, Callable],
+        static_inputs_cache: Dict[str, Tuple],
+        source_device_data: Dict[str, Any],
+        n_unknowns: int,
+        vsource_dc_vals: Array,
+        isource_dc_vals: Array,
+        shared_cache_override: "Optional[Dict[str, Array]]" = None,
+        shared_params_override: "Optional[Dict[str, Array]]" = None,
+    ) -> Tuple[Array, Array, Array, Array, Array, List[str]]:
+        """Per-source small-signal noise data at the operating point ``V`` (Phase 7b noise channel).
+
+        Runs each noise-bearing model's eval in **noise mode** (``analysis_type=3``) and reads the
+        appended noise slots [11]=power, [12]=flicker-exponent, [13]=factor. Returns
+        ``(pwr, exp, factor, hi, lo, kinds)`` flattened over every ``(device, source)`` pair across
+        all models: ``pwr``/``exp``/``factor`` are 1-D JAX arrays (differentiable in the θ-injected
+        device cache, same seam as :meth:`_extract_ac_jacobians`); ``hi``/``lo`` are reduced global
+        node indices (``-1`` = ground); ``kinds`` is a static list of ``"white"``/``"flicker"``. The
+        per-source PSD is ``factor²·pwr`` (white) or ``factor²·pwr / f^exp`` (flicker), assembled by
+        the caller. Empty arrays + ``[]`` if no model declares noise.
+        """
+        pwr_parts, exp_parts, factor_parts, hi_parts, lo_parts = [], [], [], [], []
+        kinds: List[str] = []
+
+        for model_type in list(static_inputs_cache.keys()):
+            compiled = self._compiled_models[model_type]
+            nsrc_meta = compiled.get("dae_metadata", {}).get("noise_sources", [])
+            if not nsrc_meta:
+                continue
+
+            voltage_indices, stamp_indices, voltage_node1, voltage_node2, cache, _ = (
+                static_inputs_cache[model_type]
+            )
+            hi_idx = stamp_indices.get("noise_hi_indices")
+            lo_idx = stamp_indices.get("noise_lo_indices")
+            if hi_idx is None or hi_idx.shape[1] == 0:
+                continue
+
+            voltage_updates = V[voltage_node1] - V[voltage_node2]
+            uses_analysis = compiled.get("uses_analysis", False)
+
+            shared_params = (
+                shared_params_override[model_type]
+                if shared_params_override is not None and model_type in shared_params_override
+                else compiled["shared_params"]
+            )
+            device_params = compiled["device_params"]
+            voltage_positions = compiled["voltage_positions_in_varying"]
+            vmapped_split_eval = compiled["vmapped_split_eval"]
+            shared_cache = (
+                shared_cache_override[model_type]
+                if shared_cache_override is not None and model_type in shared_cache_override
+                else compiled["shared_cache"]
+            )
+            default_simparams = compiled.get("default_simparams", jnp.array([0.0, 1.0, 1e-12]))
+
+            device_params_updated = device_params.at[:, voltage_positions].set(voltage_updates)
+            # analysis_type = 3 (noise): models that guard their noise power with `analysis("noise")`
+            # need it; models that compute it unconditionally are unaffected.
+            if uses_analysis:
+                device_params_updated = device_params_updated.at[:, -2].set(3.0)
+                device_params_updated = device_params_updated.at[:, -1].set(1e-12)
+            simparams = default_simparams.at[0].set(3.0).at[2].set(1e-12)
+
+            num_limit_states = compiled.get("num_limit_states", 0)
+            n_devices = device_params.shape[0]
+            n_lim = max(1, num_limit_states)
+            model_limit_state_in = jnp.zeros((n_devices, n_lim), dtype=get_float_dtype())
+
+            out = vmapped_split_eval(
+                shared_params, device_params_updated, shared_cache, cache, simparams,
+                model_limit_state_in,
+            )
+            batch_pwr, batch_exp, batch_factor = out[11], out[12], out[13]  # (n_dev, n_src) each
+
+            pwr_parts.append(batch_pwr.ravel())
+            exp_parts.append(batch_exp.ravel())
+            factor_parts.append(batch_factor.ravel())
+            hi_parts.append(hi_idx.ravel())
+            lo_parts.append(lo_idx.ravel())
+            # ravel is (device, source) row-major → repeat the per-source kinds once per device.
+            src_kinds = [s["kind"] for s in nsrc_meta]
+            kinds.extend(src_kinds * n_devices)
+
+        if not pwr_parts:
+            empty = jnp.zeros((0,), dtype=get_float_dtype())
+            return empty, empty, empty, jnp.zeros((0,), jnp.int32), jnp.zeros((0,), jnp.int32), []
+        return (
+            jnp.concatenate(pwr_parts),
+            jnp.concatenate(exp_parts),
+            jnp.concatenate(factor_parts),
+            jnp.concatenate(hi_parts),
+            jnp.concatenate(lo_parts),
+            kinds,
+        )
 
     def _extract_ac_jacobian_dparams(
         self,

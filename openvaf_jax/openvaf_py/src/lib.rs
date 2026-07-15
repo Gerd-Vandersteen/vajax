@@ -18,6 +18,7 @@ use mir::{FuncRef, Function, Param, Value, F_ZERO, ValueDef};
 use mir_interpret::{Interpreter, InterpreterState, Data};
 use paths::AbsPathBuf;
 use sim_back::{collect_modules, CompiledModule};
+use sim_back::dae::NoiseSourceKind;
 use typed_index_collections::{TiSlice, TiVec};
 
 // OSDI flag constants (matching osdi_0_4.rs)
@@ -66,6 +67,10 @@ struct OsdiNoiseInfo {
     name: String,
     node1: u32,
     node2: u32,  // u32::MAX for ground
+    kind: String,     // "white" | "flicker" | "table" (VA author's label distinguishes thermal/shot)
+    factor_var: u32,  // MIR Value index of the branch-orientation/mfactor scaling term
+    pwr_var: u32,     // MIR Value index of the noise power (u32::MAX for a noise_table)
+    exp_var: u32,     // MIR Value index of the flicker frequency exponent (u32::MAX unless flicker)
 }
 
 /// Source location data for mapping MIR back to VA source
@@ -893,6 +898,37 @@ impl VaModule {
                 "param_jacobian_param_names".to_string(),
                 self.param_jacobian_param_names.clone().into_py(py),
             );
+
+            // Noise sources — per-source PSD value refs for the JAX noise channel (Phase 7b). Each
+            // entry carries the noise-power/exp/factor as "mir_{idx}" strings (same convention as
+            // resist_var/react_var) so the codegen resolves them to eval outputs; a u32::MAX index →
+            // "mir_4294967295", which _mir_to_var falls back to 0 (white has no exp; table has no pwr).
+            let noise_list = PyList::empty(py);
+            for src in &self.osdi_noise_sources {
+                let nd = PyDict::new(py);
+                nd.set_item("name", &src.name).unwrap();
+                nd.set_item("kind", &src.kind).unwrap();
+                let n1 = src.node1 as usize;
+                let n1_name = if n1 < self.osdi_nodes.len() { self.osdi_nodes[n1].name.as_str() }
+                              else { "unknown" };
+                nd.set_item("node1_idx", src.node1).unwrap();
+                nd.set_item("node1_name", n1_name).unwrap();
+                if src.node2 == u32::MAX {
+                    nd.set_item("node2_idx", u32::MAX).unwrap();  // ground sentinel
+                    nd.set_item("node2_name", "gnd").unwrap();
+                } else {
+                    let n2 = src.node2 as usize;
+                    let n2_name = if n2 < self.osdi_nodes.len() { self.osdi_nodes[n2].name.as_str() }
+                                  else { "unknown" };
+                    nd.set_item("node2_idx", src.node2).unwrap();
+                    nd.set_item("node2_name", n2_name).unwrap();
+                }
+                nd.set_item("factor_var", format!("mir_{}", src.factor_var)).unwrap();
+                nd.set_item("pwr_var", format!("mir_{}", src.pwr_var)).unwrap();
+                nd.set_item("exp_var", format!("mir_{}", src.exp_var)).unwrap();
+                noise_list.append(nd).unwrap();
+            }
+            result.insert("noise_sources".to_string(), noise_list.into());
 
             // Terminal and internal node lists
             result.insert("terminals".to_string(), terminal_names.clone().into_py(py));
@@ -1884,15 +1920,27 @@ fn compile_va(path: &str, allow_analog_in_cond: bool, allow_builtin_primitives: 
             });
         }
 
-        // Extract noise sources
+        // Extract noise sources — keep the noise-power/exp/factor MIR Value indices (the compiler
+        // already computes and DCE-protects them; osdi export previously dropped them). OpenVAF knows
+        // only white/flicker/table; "thermal vs shot" is the VA author's `name` label, resolved above.
         let osdi_noise_sources: Vec<OsdiNoiseInfo> = compiled.dae_system.noise_sources
             .iter()
             .map(|src| {
                 let name = literals.resolve(&src.name).to_owned();
+                let (kind, pwr_var, exp_var) = match &src.kind {
+                    NoiseSourceKind::WhiteNoise { pwr } => ("white", u32::from(*pwr), u32::MAX),
+                    NoiseSourceKind::FlickerNoise { pwr, exp } =>
+                        ("flicker", u32::from(*pwr), u32::from(*exp)),
+                    NoiseSourceKind::NoiseTable { .. } => ("table", u32::MAX, u32::MAX),
+                };
                 OsdiNoiseInfo {
                     name,
                     node1: u32::from(src.hi),
                     node2: src.lo.map_or(u32::MAX, |lo| u32::from(lo)),
+                    kind: kind.to_string(),
+                    factor_var: u32::from(src.factor),
+                    pwr_var,
+                    exp_var,
                 }
             })
             .collect();

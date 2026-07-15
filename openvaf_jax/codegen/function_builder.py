@@ -1071,17 +1071,21 @@ class EvalFunctionBuilder(FunctionBuilder):
         self._emit_jacobian_dparam_arrays(body, ctx)
         self._emit_lim_rhs_arrays(body, ctx)
         self._emit_small_signal_arrays(body, ctx)
+        self._emit_noise_arrays(body, ctx)
 
         # Build limit_state_out (always emitted - empty array when no limits used)
         # This ensures consistent function signature regardless of whether model uses limits
         self._emit_limit_state_out(body, ctx)
 
-        # Return statement (11-tuple): (res_resist, res_react, jac_resist, jac_react,
+        # Return statement (14-tuple): (res_resist, res_react, jac_resist, jac_react,
         #                    lim_rhs_resist, lim_rhs_react,
         #                    small_signal_resist, small_signal_react, limit_state_out,
-        #                    jacobian_resist_dparam, jacobian_react_dparam)
-        # Note: limit_state_out and the two 2nd-order d(jac)/d(param) arrays are always
-        # returned (empty when off) for a uniform interface. (VASAX Step 3.2 Layer 3)
+        #                    jacobian_resist_dparam, jacobian_react_dparam,
+        #                    noise_pwr, noise_exp, noise_factor)
+        # Note: limit_state_out, the two 2nd-order d(jac)/d(param) arrays, and the three noise
+        # arrays are always returned (empty when off/none) for a uniform interface. The noise slots
+        # are APPENDED (slots 11-13) so existing positional unpacks stay valid with trailing `_`s.
+        # (VASAX Step 3.2 Layer 3 / Phase 7b noise channel)
         return_values = [
             ast_name("residuals_resist"),
             ast_name("residuals_react"),
@@ -1094,6 +1098,9 @@ class EvalFunctionBuilder(FunctionBuilder):
             ast_name("limit_state_out"),
             ast_name("jacobian_resist_dparam"),
             ast_name("jacobian_react_dparam"),
+            ast_name("noise_pwr"),
+            ast_name("noise_exp"),
+            ast_name("noise_factor"),
         ]
         body.append(return_stmt(tuple_expr(return_values)))
 
@@ -1500,6 +1507,35 @@ class EvalFunctionBuilder(FunctionBuilder):
         body.append(assign("small_signal_resist", jnp_call("array", list_expr(resist_exprs))))
         body.append(assign("small_signal_react", jnp_call("array", list_expr(react_exprs))))
 
+    def _emit_noise_arrays(self, body: List[ast.stmt], ctx: CodeGenContext):
+        """Emit per-source noise power / flicker-exponent / factor arrays (Phase 7b noise channel).
+
+        For each noise source in ``dae_data["noise_sources"]`` (surfaced by openvaf_py from the
+        compiler's already-computed, DCE-protected noise values), collect its ``pwr`` (noise power),
+        ``exp`` (flicker frequency exponent), and ``factor`` (branch-orientation/mfactor scaling) MIR
+        values — evaluated at the operating point like any other eval output. The per-source PSD is
+        reconstructed downstream as ``factor²·pwr`` (white) or ``factor²·pwr/f^exp`` (flicker); the
+        node pair + kind travel as static metadata (``get_dae_system``), not through this eval array.
+        A ``mir_{MAX}`` sentinel (white noise has no ``exp``; a table has no ``pwr``) is not a defined
+        var → falls back to 0 (``factor`` falls back to 1). Empty for models with no noise sources —
+        the eval keeps a uniform interface (three trailing slots, always present).
+        """
+        pwr_exprs: List[ast.expr] = []
+        exp_exprs: List[ast.expr] = []
+        factor_exprs: List[ast.expr] = []
+
+        for src in self.dae_data.get("noise_sources", []):
+            pwr_var = self._mir_to_var(src.get("pwr_var", ""), ctx)
+            exp_var = self._mir_to_var(src.get("exp_var", ""), ctx)
+            factor_var = self._mir_to_var(src.get("factor_var", ""), ctx)
+            pwr_exprs.append(ast_name(pwr_var) if pwr_var in ctx.defined_vars else ctx.zero())
+            exp_exprs.append(ast_name(exp_var) if exp_var in ctx.defined_vars else ctx.zero())
+            factor_exprs.append(ast_name(factor_var) if factor_var in ctx.defined_vars else ctx.one())
+
+        body.append(assign("noise_pwr", jnp_call("array", list_expr(pwr_exprs))))
+        body.append(assign("noise_exp", jnp_call("array", list_expr(exp_exprs))))
+        body.append(assign("noise_factor", jnp_call("array", list_expr(factor_exprs))))
+
     def _emit_limit_state_out(self, body: List[ast.stmt], ctx: CodeGenContext):
         """Emit limit_state_out array from stored limit values.
 
@@ -1585,6 +1621,17 @@ class EvalFunctionBuilder(FunctionBuilder):
             # 2nd-order d(jac)/d(param) vars (lists; absent when the feature is off)
             for key in ["resist_dparam_vars", "react_dparam_vars"]:
                 for mir_ref in entry.get(key, []):
+                    var_name = self._mir_to_var(mir_ref, ctx)
+                    if var_name:
+                        output_vars.add(var_name)
+
+        # Noise-channel vars (pwr/exp/factor per source; Phase 7b) — a noise power computed only in a
+        # conditional (e.g. type-dependent) branch would NameError in the output array otherwise. The
+        # mir_{MAX} sentinel (white has no exp; table no pwr) maps to a var that stays 0.0 — harmless.
+        for src in self.dae_data.get("noise_sources", []):
+            for key in ["pwr_var", "exp_var", "factor_var"]:
+                mir_ref = src.get(key, "")
+                if mir_ref:
                     var_name = self._mir_to_var(mir_ref, ctx)
                     if var_name:
                         output_vars.add(var_name)
