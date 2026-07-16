@@ -2097,18 +2097,23 @@ class CircuitEngine:
         shared_cache_override: "Optional[Dict[str, Array]]" = None,
     ) -> Dict[str, Tuple[Array, Array]]:
         """Analytic ``(∂Jr/∂θ, ∂Jc/∂θ)`` at ``V`` — the 2nd-order sibling of
-        :meth:`_extract_ac_jacobians` (VASAX Step 3.2 Layer 4).
+        :meth:`_extract_ac_jacobians` (VASAX Step 3.2 Layer 4 + KB §3q segmentation).
 
-        Reads the eval's 2nd-order slots [9] ``jacobian_resist_dparam`` / [10]
-        ``jacobian_react_dparam`` (shape ``(n_dev, n_entries, n_params)``; the θ axis is that model's
-        ``param_jacobian_param_names``, non-empty only when the ``OPENVAF_2ND_ORDER`` feature was
-        enabled at compile). Each θ-column is scattered into a dense ``n_unknowns × n_unknowns``
-        matrix through the **same** ``jac_row/col_indices`` COO maps + NaN mask as the value path.
+        Runs the model's chained ``vmapped_dparam_segments`` (each a separately-jitted
+        ~budget-sized piece of the ∂jac/∂θ closure; the feature-on monolith is
+        LLVM-uncompilable at BSIM4 scale) **eagerly from host code**, threading the
+        carry tuple between them — nothing re-fuses because this method is never
+        called under a jit. The last segment returns ``jacobian_resist_dparam`` /
+        ``jacobian_react_dparam`` (shape ``(n_dev, n_entries, n_params)``; the θ axis
+        is that model's ``param_jacobian_param_names``, non-empty only when the
+        ``OPENVAF_2ND_ORDER`` feature was enabled at compile). Each θ-column is
+        scattered into a dense ``n_unknowns × n_unknowns`` matrix through the **same**
+        ``jac_row/col_indices`` COO maps + NaN mask as the value path.
 
         Returns ``{model_type: (dJr, dJc)}`` where each is ``(n_params, n_unknowns, n_unknowns)`` in
         global node space; models with no 2nd-order params are omitted. The constant-G vsource block
         and the ``1e-12·I`` regularizer are θ-independent, so they are **not** included (their
-        derivative is zero). Analytic (a forward device eval + segment_sum) — no AD over the eval.
+        derivative is zero). Analytic (forward segment evals + segment_sum) — no AD over the eval.
         """
         result: Dict[str, Tuple[Array, Array]] = {}
         for model_type in static_inputs_cache.keys():
@@ -2118,12 +2123,14 @@ class CircuitEngine:
             voltage_updates = V[voltage_node1] - V[voltage_node2]
 
             compiled = self._compiled_models[model_type]
+            seg_fns = compiled.get("vmapped_dparam_segments", [])
+            if not seg_fns:
+                continue  # model compiled without the 2nd-order feature
             uses_analysis = compiled.get("uses_analysis", False)
             uses_simparam_gmin = compiled.get("uses_simparam_gmin", False)
             shared_params = compiled["shared_params"]
             device_params = compiled["device_params"]
             voltage_positions = compiled["voltage_positions_in_varying"]
-            vmapped_split_eval = compiled["vmapped_split_eval"]
             shared_cache = (
                 shared_cache_override[model_type]
                 if shared_cache_override is not None and model_type in shared_cache_override
@@ -2144,13 +2151,16 @@ class CircuitEngine:
             n_lim = max(1, num_limit_states)
             model_limit_state_in = jnp.zeros((n_devices, n_lim), dtype=get_float_dtype())
 
-            # Separate eval call keeping slots [9]/[10] (the value path discards them).
-            out = vmapped_split_eval(
+            # Chained segment evals, eager in host code (each segment is its own jit
+            # unit; carries stay on-device between calls).
+            eval_args = (
                 shared_params, device_params_updated, shared_cache, cache, simparams,
                 model_limit_state_in,
             )
-            batch_dr = out[9]  # (n_dev, n_entries, n_params)
-            batch_dc = out[10]
+            carry = seg_fns[0](*eval_args)
+            for f in seg_fns[1:]:
+                carry = f(carry, *eval_args)
+            batch_dr, batch_dc = carry  # each (n_dev, n_entries, n_params)
             n_params = batch_dr.shape[-1]
             if n_params == 0:
                 continue  # model carries no 2nd-order params — nothing to contribute

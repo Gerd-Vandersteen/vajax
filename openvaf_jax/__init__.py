@@ -1389,6 +1389,17 @@ class OpenVAFToJAX:
         t2 = time.perf_counter()
         logger.info(f"    translate_eval_array_with_cache_split: exec() done in {t2 - t1:.1f}s")
 
+        # 2nd-order dparam segments (KB §3q): each is its own self-contained module
+        # (exec_with_cache caches one fn per code hash, and separate modules keep the
+        # jit units separate — the whole point of the segmentation). Empty feature-off.
+        dparam_segment_fns = []
+        for seg_name, seg_code in builder.dparam_segments:
+            if os.environ.get("OPENVAF_JAX_DUMP_CODE"):
+                seg_path = os.path.join(dump_dir, f"{seg_name}_{len(seg_code)}chars.py")
+                with open(seg_path, "w") as df:
+                    df.write(seg_code)
+            dparam_segment_fns.append(exec_with_cache(seg_code, seg_name))
+
         # Build metadata using v2 API for clean node names
         node_names = [res["node_name"] for res in self.dae_data["residuals"]]
         node_indices = [res["node_idx"] for res in self.dae_data["residuals"]]
@@ -1411,6 +1422,12 @@ class OpenVAFToJAX:
             # θ axis for the eval_fn's 2nd-order jacobian_{resist,react}_dparam outputs
             # (empty unless the OPENVAF_2ND_ORDER feature was enabled). VASAX Step 3.2 Layer 3.
             "param_jacobian_param_names": self.dae_data.get("param_jacobian_param_names", []),
+            # Chained ∂jac/∂θ segment callables (KB §3q segmentation): seg0(args...) ->
+            # carry; seg_i(args..., carry) -> carry; last returns
+            # (jacobian_resist_dparam, jacobian_react_dparam) each (n_entries, n_θ).
+            # The eval_fn's own dparam slots are EMPTY (n_entries, 0) when segments exist.
+            "dparam_segments": dparam_segment_fns,
+            "dparam_segment_meta": builder.dparam_segment_meta,
             "terminals": self.dae_data["terminals"],
             "internal_nodes": self.dae_data["internal_nodes"],
             "num_terminals": self.dae_data["num_terminals"],

@@ -1240,6 +1240,22 @@ def prepare_static_inputs(
         # θ axis of the eval's 2nd-order jacobian_{resist,react}_dparam slots (empty unless the
         # OPENVAF_2ND_ORDER feature was enabled at compile). VASAX Step 3.2 Layer 4.
         compiled["param_jacobian_param_names"] = split_meta.get("param_jacobian_param_names", [])
+        # 2nd-order chained ∂jac/∂θ segments (KB §3q segmentation): each its own jit
+        # unit so LLVM never sees the feature-on monolith. seg0(*eval_args) -> carry;
+        # seg_i(carry, *eval_args) -> carry; last returns the two (n_dev-batched)
+        # dparam arrays. jax.jit here is lazy — XLA compiles at first call, NOT at
+        # load, and warmup_device_models never touches these.
+        seg_fns = [partial(f, limit_funcs=limit_funcs) for f in split_meta.get("dparam_segments", [])]
+        compiled["vmapped_dparam_segments"] = [
+            jax.jit(
+                jax.vmap(
+                    f,
+                    in_axes=(None, 0, None, 0, None, 0) if i == 0 else (0, None, 0, None, 0, None, 0),
+                )
+            )
+            for i, f in enumerate(seg_fns)
+        ]
+        compiled["dparam_segment_meta"] = split_meta.get("dparam_segment_meta", {})
         compiled["use_device_limiting"] = use_device_limiting
         compiled["limit_param_map"] = limit_param_map
 
@@ -1269,6 +1285,15 @@ def warmup_device_models(
     """
     for model_type, compiled in compiled_models.items():
         if model_type not in static_inputs_cache:
+            continue
+
+        if compiled.get("vmapped_dparam_segments"):
+            # 2nd-order engine (KB §3q): its value eval is deliberately NOT warmed —
+            # feature-on shifts init-cacheable primal chains back into eval, so the
+            # (sliced) value eval is still LLVM-expensive at BSIM4 scale, and a
+            # feature-on engine exists to serve the ∂jac/∂θ segments (compiled
+            # lazily at first use), not the value path.
+            logger.info(f"  {model_type}: 2nd-order engine — skipping value-eval warmup")
             continue
 
         t0 = time.perf_counter()

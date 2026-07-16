@@ -946,6 +946,11 @@ class EvalFunctionBuilder(FunctionBuilder):
         self.param_idx_to_val = param_idx_to_val
         self.eval_param_names = eval_param_names or []
         self.limit_metadata = {}  # Will be populated by build_with_cache_split if limit functions used
+        # 2nd-order segmentation outputs (KB §3q): [(fn_name, module_source)] chained
+        # dparam segment modules + their meta. Populated by build_with_cache_split
+        # when the feature is on; empty otherwise.
+        self.dparam_segments: List[Tuple[str, str]] = []
+        self.dparam_segment_meta: Dict[str, Any] = {}
 
     def build_with_cache_split(
         self,
@@ -1128,6 +1133,27 @@ class EvalFunctionBuilder(FunctionBuilder):
             "limit_state_in",
             "limit_funcs",
         ]
+
+        # 2nd-order segmentation post-pass (VASAX KB §3q). The feature-on monolith is
+        # XLA/LLVM-uncompilable at BSIM4 scale (37k ops, >2 h), so: emit the ∂jac/∂θ
+        # closure as K chained ~budget-sized segment MODULES (self.dparam_segments,
+        # jitted separately by the consumer — LLVM never sees the monolith), and slice
+        # the value eval back to (near) feature-off size with empty dparam slots
+        # (14-tuple arity unchanged, so every positional unpack stays valid).
+        # Feature-off: param_jacobian_param_names is empty ⇒ byte-identical emission.
+        if self.dae_data.get("param_jacobian_param_names"):
+            from .slicer import build_dparam_segments, slice_value_body
+
+            self.dparam_segments, self.dparam_segment_meta = build_dparam_segments(body, args)
+            body = slice_value_body(body, len(self.dae_data["jacobian"]))
+            logger.info(
+                "    2nd-order segmentation: value body %d stmts; %d dparam segments "
+                "(stmts %s, carries %s)",
+                len(body),
+                self.dparam_segment_meta["n_segments"],
+                self.dparam_segment_meta["segment_stmts"],
+                self.dparam_segment_meta["carry_sizes"],
+            )
 
         func = function_def(fn_name, args, body)
 
