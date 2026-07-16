@@ -2095,9 +2095,15 @@ class CircuitEngine:
         vsource_dc_vals: Array,
         isource_dc_vals: Array,
         shared_cache_override: "Optional[Dict[str, Array]]" = None,
+        shared_params_override: "Optional[Dict[str, Array]]" = None,
     ) -> Dict[str, Tuple[Array, Array]]:
         """Analytic ``(∂Jr/∂θ, ∂Jc/∂θ)`` at ``V`` — the 2nd-order sibling of
         :meth:`_extract_ac_jacobians` (VASAX Step 3.2 Layer 4 + KB §3q segmentation).
+
+        ``shared_params_override`` threads LIVE eval-direct params (θ-moved shared
+        params, KB §3o) into the segment evals — without it a LIVE model's segments
+        would see stale baseline values at θ ≠ θ0 (the same seam bug the value path
+        fixed for ASM-HEMT).
 
         Runs the model's chained ``vmapped_dparam_segments`` (each a separately-jitted
         ~budget-sized piece of the ∂jac/∂θ closure; the feature-on monolith is
@@ -2128,7 +2134,11 @@ class CircuitEngine:
                 continue  # model compiled without the 2nd-order feature
             uses_analysis = compiled.get("uses_analysis", False)
             uses_simparam_gmin = compiled.get("uses_simparam_gmin", False)
-            shared_params = compiled["shared_params"]
+            shared_params = (
+                shared_params_override[model_type]
+                if shared_params_override is not None and model_type in shared_params_override
+                else compiled["shared_params"]
+            )
             device_params = compiled["device_params"]
             voltage_positions = compiled["voltage_positions_in_varying"]
             shared_cache = (
