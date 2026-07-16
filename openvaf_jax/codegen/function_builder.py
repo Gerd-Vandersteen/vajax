@@ -68,6 +68,17 @@ class FunctionBuilder:
         # through models whose init/eval contains counted loops (e.g. BSIM4's toxp/nf
         # loops). Default OFF: every existing model emits byte-identical code.
         self.differentiable_loops: bool = False
+        # Loop-carry dtype for while_loop/scan state. Historically float32 ("type
+        # consistency"), which silently truncates every loop-carried value in an x64
+        # pipeline. With the 2nd-order feature on (VASAX KB §3q), eval-side tangent
+        # loops carry f64 tangents + an int counter, so the carry must be float64.
+        # Gated on the env (already folded into the model cache key, cache.py) so
+        # feature-off emission stays byte-identical; the universal f32 wart is a
+        # tracked follow-up.
+        import os as _os
+        self.loop_carry_dtype: str = (
+            "float64" if _os.environ.get("OPENVAF_2ND_ORDER") is not None else "float32"
+        )
         # Static iteration count (upper bound) used for the scan when
         # ``differentiable_loops`` is on. Must be >= the loop's max trip count; the
         # where-freeze makes iterations past the real exit count exact no-ops.
@@ -309,8 +320,8 @@ class FunctionBuilder:
             return
 
         # Build initial state tuple
-        # Cast all values to float32 to ensure type consistency
-        init_vals = [jnp_call("float32", ctx.get_operand(lc[1])) for lc in loop_state]
+        # Cast all values to the carry dtype to ensure type consistency
+        init_vals = [jnp_call(self.loop_carry_dtype, ctx.get_operand(lc[1])) for lc in loop_state]
         init_state = tuple_expr(init_vals) if len(init_vals) > 1 else init_vals[0]
 
         # Pre-initialize PHI variables from non-header loop body blocks
@@ -525,8 +536,8 @@ class FunctionBuilder:
             else:
                 # Fallback to operand resolution
                 val_expr = ctx.get_operand(update)
-            # Cast to float32 to ensure type consistency
-            cast_expr = jnp_call("float32", val_expr)
+            # Cast to the carry dtype to ensure type consistency
+            cast_expr = jnp_call(self.loop_carry_dtype, val_expr)
             update_vals.append(cast_expr)
 
         if len(update_vals) > 1:

@@ -183,7 +183,11 @@ def compute_va_hash(va_path: Path) -> str:
     # cache entries must be retired at once.
     h.update(b"|noise_channel:1")
     if os.environ.get("OPENVAF_2ND_ORDER") is not None:
-        h.update(b"|2nd_order:")
+        # v2 = the tangent-loop fix set (KB §3q): Rust loop-atomic taint + no caching of
+        # loop-interior values (whole loops stay in eval, counter phis threaded) + the
+        # float64 loop-carry dtype in _emit_loop. Pre-fix feature-on caches bake the torn
+        # (constant-condition) loops into both mir_data.pkl and eval_fn.py — retire them.
+        h.update(b"|2nd_order:v2:")
         h.update(os.environ.get("OPENVAF_2ND_ORDER_PARAMS", "w,l").encode())
     if os.environ.get("OPENVAF_DIFFERENTIABLE_LOOPS") is not None:
         h.update(b"|diff_loops")
