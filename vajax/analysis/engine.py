@@ -2175,30 +2175,49 @@ class CircuitEngine:
             if n_params == 0:
                 continue  # model carries no 2nd-order params — nothing to contribute
 
-            jac_row_idx = stamp_indices["jac_row_indices"]
-            jac_col_idx = stamp_indices["jac_col_indices"]
-            flat_jac_rows = jac_row_idx.ravel()
-            flat_jac_cols = jac_col_idx.ravel()
-            valid_jac = (flat_jac_rows >= 0) & (flat_jac_cols >= 0)
-            flat_indices = (
-                jnp.where(valid_jac, flat_jac_rows, 0) * n_unknowns
-                + jnp.where(valid_jac, flat_jac_cols, 0)
-            )
+            # The θ-axis COO scatter is jitted ONCE per (model, n_unknowns) and memoized on the
+            # compiled dict (the established home of the model's callables, next to
+            # `vmapped_dparam_segments`). An eager `jax.vmap(assemble_one)` here re-traced through
+            # the batching interpreter on EVERY call — the S0-measured hybrid warm-time host tax
+            # (tens of ms + spurious per-call XLA compiles at BSIM4 scale; VASAX KB §3q addendum).
+            # `n_unknowns` is a method argument, not model state, hence the per-n_unknowns key;
+            # the raw COO index maps are jit ARGUMENTS (not closure state), so the compiled scatter
+            # serves any caller-provided stamp maps of matching shape.
+            scatter_cache = compiled.setdefault("dparam_scatter_jit", {})
+            jscatter = scatter_cache.get(n_unknowns)
+            if jscatter is None:
 
-            def assemble_one(vals_p):  # vals_p (n_dev*n_entries,) -> (n_unknowns, n_unknowns)
-                masked = jnp.where(valid_jac, vals_p, 0.0)
-                masked = jnp.where(jnp.isnan(masked), 0.0, masked)
-                flat = jax.ops.segment_sum(
-                    masked, flat_indices, num_segments=n_unknowns * n_unknowns
-                )
-                return flat.reshape((n_unknowns, n_unknowns))
+                def _scatter(batch_dr, batch_dc, flat_rows, flat_cols, _n=n_unknowns):
+                    valid_jac = (flat_rows >= 0) & (flat_cols >= 0)
+                    flat_indices = (
+                        jnp.where(valid_jac, flat_rows, 0) * _n
+                        + jnp.where(valid_jac, flat_cols, 0)
+                    )
 
-            # (n_dev, n_entries, n_params) -> (n_params, n_dev*n_entries), row-major parallel to the
-            # value jac (entry i lines up with jacobian[i]), then vmap the scatter over the θ axis.
-            dr_by_p = batch_dr.reshape(-1, n_params).T
-            dc_by_p = batch_dc.reshape(-1, n_params).T
-            dJr = jax.vmap(assemble_one)(dr_by_p)  # (n_params, n_unknowns, n_unknowns)
-            dJc = jax.vmap(assemble_one)(dc_by_p)
+                    def assemble_one(vals_p):  # (n_dev*n_entries,) -> (_n, _n)
+                        masked = jnp.where(valid_jac, vals_p, 0.0)
+                        masked = jnp.where(jnp.isnan(masked), 0.0, masked)
+                        flat = jax.ops.segment_sum(
+                            masked, flat_indices, num_segments=_n * _n
+                        )
+                        return flat.reshape((_n, _n))
+
+                    # (n_dev, n_entries, n_params) -> (n_params, n_dev*n_entries), row-major
+                    # parallel to the value jac (entry i lines up with jacobian[i]), then vmap
+                    # the scatter over the θ axis.
+                    n_p = batch_dr.shape[-1]
+                    dr_by_p = batch_dr.reshape(-1, n_p).T
+                    dc_by_p = batch_dc.reshape(-1, n_p).T
+                    return jax.vmap(assemble_one)(dr_by_p), jax.vmap(assemble_one)(dc_by_p)
+
+                jscatter = jax.jit(_scatter)
+                scatter_cache[n_unknowns] = jscatter
+
+            dJr, dJc = jscatter(
+                batch_dr, batch_dc,
+                stamp_indices["jac_row_indices"].ravel(),
+                stamp_indices["jac_col_indices"].ravel(),
+            )  # each (n_params, n_unknowns, n_unknowns)
             result[model_type] = (dJr, dJc)
 
         return result
