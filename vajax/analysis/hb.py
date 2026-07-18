@@ -46,7 +46,9 @@ class HBConfig:
         freq: Fundamental frequencies in Hz (list of floats)
         nharm: Number of harmonics for each fundamental (int or list)
         truncation: 'box' or 'diamond' truncation scheme
-        sample_factor: Oversampling factor for the nonlinearity evaluation (>= 1.0)
+        sample_factor: Oversampling factor for the nonlinearity evaluation
+            (1.0 = critical sampling, aliases out-of-band products; > 1 evaluates on a
+            finer artificial grid and truncates them instead — build_afm_oversampled)
         max_iterations: Maximum NR iterations
         abstol: Absolute tolerance for convergence
         reltol: Relative tolerance for convergence
@@ -55,7 +57,7 @@ class HBConfig:
     freq: List[float] = field(default_factory=lambda: [1e3])
     nharm: Union[int, List[int]] = 4
     truncation: str = "diamond"
-    sample_factor: float = 2.0
+    sample_factor: float = 1.0
     max_iterations: int = 100
     abstol: float = 1e-9
     reltol: float = 1e-6
@@ -255,42 +257,80 @@ def build_afm_grid(config: HBConfig) -> AFMGrid:
     )
 
 
-def _build_afm_apft_matrices(afm: AFMGrid) -> Tuple[Array, Array, Array]:
-    """APFT/IAPFT/DDT on the AFM grid — the exact (orthogonal) mapped DFT.
+def _afm_basis(n_samples: int, nf: int) -> Tuple[Array, Array]:
+    """(analysis, synthesis) of the ``nf``-bin artificial-harmonic basis on a uniform
+    grid of ``n_samples`` points of the artificial period.
 
-    Closed form, no matrix inversion: after canonical bin-sorting the basis
-    depends only on ``NT`` (bin k is the k-th artificial harmonic); the
-    physics enters through the signed true frequencies in ``Omega``.
-    Spectrum layout stays ``[DC, Re1, Im1, ...]``.
+    After canonical bin-sorting the basis depends only on the grid length (bin k is the
+    k-th artificial harmonic). Requires ``nf - 1 < n_samples / 2`` (no aliasing) — always
+    true for the critical grid (``n_samples = NT = 2nf−1``) and any finer one.
+    Spectrum layout ``[DC, Re1, Im1, ...]``; analysis = exact DFT rows (DC ``1/n``,
+    cos/sin ``2/n`` — orthogonal, no inversion).
     """
-    NT, nf = afm.NT, afm.nf
     dtype = get_float_dtype()
-    n = jnp.arange(NT, dtype=dtype)
+    n = jnp.arange(n_samples, dtype=dtype)
     k = jnp.arange(1, nf, dtype=dtype)
-    theta = TWO_PI * jnp.outer(n, k) / NT  # (NT, nf-1)
+    theta = TWO_PI * jnp.outer(n, k) / n_samples  # (n_samples, nf-1)
     C = jnp.cos(theta)
     S = jnp.sin(theta)
 
-    # IAPFT (NT, 2nf-1): [1 | cos_1 sin_1 | cos_2 sin_2 | ...]
-    cs = jnp.stack([C, S], axis=2).reshape(NT, 2 * (nf - 1))
-    IAPFT = jnp.concatenate([jnp.ones((NT, 1), dtype=dtype), cs], axis=1)
+    cs = jnp.stack([C, S], axis=2).reshape(n_samples, 2 * (nf - 1))
+    synthesis = jnp.concatenate([jnp.ones((n_samples, 1), dtype=dtype), cs], axis=1)
 
-    # APFT (2nf-1, NT): exact DFT analysis — DC 1/NT, cos/sin rows 2/NT.
-    cs_t = jnp.stack([C.T, S.T], axis=1).reshape(2 * (nf - 1), NT)
-    APFT = jnp.concatenate(
-        [jnp.full((1, NT), 1.0 / NT, dtype=dtype), (2.0 / NT) * cs_t], axis=0
+    cs_t = jnp.stack([C.T, S.T], axis=1).reshape(2 * (nf - 1), n_samples)
+    analysis = jnp.concatenate(
+        [jnp.full((1, n_samples), 1.0 / n_samples, dtype=dtype),
+         (2.0 / n_samples) * cs_t], axis=0
     )
+    return analysis, synthesis
 
-    # Omega: per canonical frequency the real 2x2 rotation with SIGNED
-    # true omega ([Re, Im] -> omega * [-Im, Re]).
-    Omega = jnp.zeros((2 * nf - 1, 2 * nf - 1), dtype=dtype)
+
+def _afm_omega(afm: AFMGrid) -> Array:
+    """The real j·ω block matrix: per canonical frequency the 2x2 rotation with SIGNED
+    true omega (``[Re, Im] -> omega * [-Im, Re]``)."""
+    nf = afm.nf
+    Omega = jnp.zeros((2 * nf - 1, 2 * nf - 1), dtype=get_float_dtype())
     for j in range(1, nf):
         omega_j = TWO_PI * afm.freqs_signed[j]
         Omega = Omega.at[2 * j - 1, 2 * j].set(-omega_j)
         Omega = Omega.at[2 * j, 2 * j - 1].set(omega_j)
+    return Omega
 
-    DDT = IAPFT @ Omega @ APFT
+
+def _build_afm_apft_matrices(afm: AFMGrid) -> Tuple[Array, Array, Array]:
+    """APFT/IAPFT/DDT on the critical AFM grid — the exact (orthogonal) mapped DFT."""
+    APFT, IAPFT = _afm_basis(afm.NT, afm.nf)
+    DDT = IAPFT @ _afm_omega(afm) @ APFT
     return APFT, IAPFT, DDT
+
+
+def build_afm_oversampled(afm: AFMGrid, sample_factor: float
+                          ) -> Tuple[Array, Array, Array, int]:
+    """Oversampled-evaluation operators ``(U, P, D_os, NT_os)`` for a square HB residual.
+
+    The unknowns stay the ``NT`` critical samples; the nonlinearity is evaluated on a
+    finer uniform artificial grid of ``NT_os = next odd ≥ ceil(sample_factor·NT)`` points
+    and projected back, so out-of-band products are **truncated instead of aliased**:
+
+    - ``U  = IAPFT_os @ APFT_c``  (NT_os, NT): band-limited interpolation of the critical
+      samples (and of the tone excitation) onto the oversampled grid;
+    - ``P  = IAPFT_c @ APFT_os``  (NT, NT_os): de-aliasing projection of the evaluated
+      nonlinearity back onto the critical samples;
+    - ``D_os = IAPFT_c @ Omega @ APFT_os``: the projecting spectral derivative.
+
+    ``F = P @ i(U·Y) + D_os @ q(U·Y)`` is still square in ``Y``; ``sample_factor <= 1``
+    degenerates to ``U = P = I``, ``D_os = DDT`` (asserted equal by the caller's tests).
+    """
+    NT, nf = afm.NT, afm.nf
+    NT_os = max(NT, int(-(-sample_factor * NT // 1)))  # ceil
+    if NT_os % 2 == 0:
+        NT_os += 1
+    APFT_c, IAPFT_c = _afm_basis(NT, nf)
+    APFT_os, IAPFT_os = _afm_basis(NT_os, nf)
+    U = IAPFT_os @ APFT_c
+    P = IAPFT_c @ APFT_os
+    D_os = IAPFT_c @ _afm_omega(afm) @ APFT_os
+    return U, P, D_os, NT_os
 
 
 def afm_td_to_fd(x: Array, afm: AFMGrid) -> Array:
